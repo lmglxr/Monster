@@ -293,10 +293,13 @@ class Bot:
         self.portal_template = self._load_gray_template("portal.png")
         self.panel_template = self._load_gray_template("entry_panel_title.png")
         self.map_template = self._load_gray_template("map_open_indicator.png")
+        self.revive_template = self._load_gray_template("revive_panel_title.png")
         self.running = False
         self.stopped = False
         self.last_fatigue: Optional[int] = None
         self.phase = "idle"
+        self.revive_epoch = 0
+        self._next_revive_probe = 0.0
         self._f8_down = False
         self._f12_down = False
 
@@ -341,6 +344,11 @@ class Bot:
                     time.sleep(0.05)
                 deadline += time.monotonic() - pause_started
                 continue
+            revive_started = time.monotonic()
+            if self.check_and_handle_revive():
+                # 死亡倒计时不应吃掉寻路、加载或战斗的原有等待时间。
+                deadline += time.monotonic() - revive_started
+                continue
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
         return True
 
@@ -363,6 +371,125 @@ class Bot:
         if self.phase not in ("normal_combat", "boss_combat"):
             raise RuntimeError(f"输入隔离阻止了在 {self.phase} 阶段发送战斗按键 {name}。")
         self.window.tap_key(name, hold_seconds=hold_seconds, live=self.live)
+
+    def revive_panel_visible(
+        self, frame: Optional[np.ndarray] = None
+    ) -> tuple[bool, float]:
+        if self.revive_template is None:
+            return False, 0.0
+        if frame is None:
+            frame = self.window.capture()
+        _, score = self.template_match(frame, self.revive_template)
+        threshold = float(self.cfg.get("revive", {}).get("panel_match_threshold", 0.78))
+        return score >= threshold, score
+
+    def revive_ready(self, frame: np.ndarray) -> tuple[bool, float]:
+        """用按钮的橙色占比判断“原地复活”是否已解除 15 秒灰置。"""
+        revive_cfg = self.cfg.get("revive", {})
+        region = revive_cfg.get(
+            "ready_button_region", [0.396, 0.551, 0.479, 0.588]
+        )
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = region
+        crop = frame[int(y1 * h):int(y2 * h), int(x1 * w):int(x2 * w)]
+        if crop.size == 0:
+            return False, 0.0
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        orange = (
+            (hsv[:, :, 0] >= 5)
+            & (hsv[:, :, 0] <= 35)
+            & (hsv[:, :, 1] >= 80)
+            & (hsv[:, :, 2] >= 80)
+        )
+        ratio = float(np.mean(orange))
+        threshold = float(revive_cfg.get("ready_orange_ratio", 0.45))
+        return ratio >= threshold, ratio
+
+    def check_and_handle_revive(self, force: bool = False) -> bool:
+        """发现死亡面板后冻结输入，等待原地复活可用并点击。"""
+        if self.revive_template is None or not self.live:
+            return False
+        revive_cfg = self.cfg.get("revive", {})
+        now = time.monotonic()
+        if not force and now < self._next_revive_probe:
+            return False
+        self._next_revive_probe = now + float(
+            revive_cfg.get("check_interval_seconds", 0.5)
+        )
+        frame = self.window.capture()
+        visible, score = self.revive_panel_visible(frame)
+        if not visible:
+            return False
+
+        previous_phase = self.phase
+        self.set_phase("reviving")
+        logging.warning("检测到死亡复活面板（匹配分数 %.3f），已冻结所有操作。", score)
+        point = revive_cfg.get("revive_button_point", [0.4375, 0.5833])
+        deadline = time.monotonic() + float(revive_cfg.get("max_wait_seconds", 45.0))
+        last_status_log = 0.0
+        clicks = 0
+        max_clicks = max(1, int(revive_cfg.get("max_click_attempts", 3)))
+        foreground_warned = False
+
+        while time.monotonic() < deadline and not self.stopped:
+            self.check_control_keys()
+            if not self.running:
+                pause_started = time.monotonic()
+                while not self.running and not self.stopped:
+                    self.check_control_keys()
+                    time.sleep(0.05)
+                deadline += time.monotonic() - pause_started
+                continue
+            if not self.window.is_foreground():
+                if not foreground_warned:
+                    logging.warning("死亡等待中游戏失去前台；切回游戏后才会点击原地复活。")
+                    foreground_warned = True
+                foreground_lost_at = time.monotonic()
+                while not self.window.is_foreground() and not self.stopped:
+                    self.check_control_keys()
+                    time.sleep(0.2)
+                deadline += time.monotonic() - foreground_lost_at
+                continue
+            foreground_warned = False
+            # 鼠标保持在按钮上：按钮可用时会稳定显示为橙色。
+            self.window.move_client(
+                *self.window.normalized_to_client(point), live=self.live
+            )
+            frame = self.window.capture()
+            visible, panel_score = self.revive_panel_visible(frame)
+            if not visible:
+                logging.info("复活面板已消失，确认人物已恢复操作。")
+                self.revive_epoch += 1
+                self.set_phase(
+                    previous_phase,
+                    combat=previous_phase in ("normal_combat", "boss_combat"),
+                )
+                time.sleep(float(revive_cfg.get("post_revive_seconds", 1.0)))
+                return True
+            ready, orange_ratio = self.revive_ready(frame)
+            if ready and clicks < max_clicks:
+                clicks += 1
+                logging.info(
+                    "原地复活按钮已可用（橙色占比 %.3f），点击第 %s/%s 次。",
+                    orange_ratio,
+                    clicks,
+                    max_clicks,
+                )
+                self.window.click_normalized(point, live=self.live)
+                time.sleep(0.8)
+                continue
+            if time.monotonic() - last_status_log >= 3.0:
+                logging.info(
+                    "等待原地复活解除倒计时：面板 %.3f，按钮橙色占比 %.3f。",
+                    panel_score,
+                    orange_ratio,
+                )
+                last_status_log = time.monotonic()
+            time.sleep(0.2)
+
+        if self.stopped:
+            return True
+        raise RuntimeError("检测到死亡，但等待原地复活超时；已安全暂停。")
 
     def template_match(
         self, frame: np.ndarray, template: Optional[np.ndarray]
@@ -452,8 +579,11 @@ class Bot:
         if self.ocr is None:
             self.ocr = FatigueOCR(self.cfg.get("debug"))
         hover = self.window.normalized_to_client(self.cfg["fatigue"]["hover_point"])
+        revive_epoch = self.revive_epoch
         self.window.move_client(*hover, live=self.live)
         self.wait(0.8)
+        if self.revive_epoch != revive_epoch:
+            return self.read_fatigue(attempts=attempts)
         values: list[int] = []
         for _ in range(attempts):
             frame = self.window.capture()
@@ -489,6 +619,10 @@ class Bot:
                     self.check_control_keys()
                     time.sleep(0.2)
                 continue
+            if self.check_and_handle_revive():
+                next_attack = time.monotonic()
+                next_pickup = time.monotonic()
+                continue
             now = time.monotonic()
             if now >= next_attack:
                 self.tap_combat_key(combat["attack_key"])
@@ -507,10 +641,15 @@ class Bot:
     def travel_to_first_entrance(self) -> None:
         logging.info("状态：通过普通地图寻路到副本入口。")
         self.set_phase("normal_navigation")
-        self.wait(self.cfg["timing"].get("combat_input_quiet_seconds", 1.0))
-        self.open_map()
-        self.click("normal_portal_marker")
-        self.wait(self.cfg["timing"]["normal_auto_path_seconds"])
+        while not self.stopped:
+            revive_epoch = self.revive_epoch
+            self.wait(self.cfg["timing"].get("combat_input_quiet_seconds", 1.0))
+            self.open_map()
+            self.click("normal_portal_marker")
+            self.wait(self.cfg["timing"]["normal_auto_path_seconds"])
+            if self.revive_epoch == revive_epoch:
+                return
+            logging.info("寻路期间发生过复活，重新打开地图并下发入口寻路。")
 
     def enter_dungeon(self) -> None:
         logging.info("状态：触发入口并进入冰牙海湾。")
@@ -522,9 +661,14 @@ class Bot:
     def travel_to_boss(self) -> None:
         logging.info("状态：副本内地图寻路到 BOSS。")
         self.set_phase("dungeon_navigation")
-        self.open_map()
-        self.click("dungeon_boss_marker")
-        self.wait(self.cfg["timing"]["boss_auto_path_seconds"])
+        while not self.stopped:
+            revive_epoch = self.revive_epoch
+            self.open_map()
+            self.click("dungeon_boss_marker")
+            self.wait(self.cfg["timing"]["boss_auto_path_seconds"])
+            if self.revive_epoch == revive_epoch:
+                return
+            logging.info("副本寻路期间发生过复活，重新下发 BOSS 寻路。")
 
     def fight_boss(self) -> None:
         logging.info("状态：寻找并攻击 BOSS。")
@@ -532,17 +676,23 @@ class Bot:
         self.log_tail.boss_seen = False
         self.log_tail.boss_dead = False
         deadline = time.monotonic() + self.cfg["timing"]["boss_timeout_seconds"]
+        revive_epoch = self.revive_epoch
         while time.monotonic() < deadline and not self.stopped:
+            if self.check_and_handle_revive():
+                deadline = time.monotonic() + self.cfg["timing"]["boss_timeout_seconds"]
+                revive_epoch = self.revive_epoch
+                continue
             self.tap_combat_key(self.cfg["combat"]["attack_key"])
-            lines = self.log_tail.poll()
+            self.log_tail.poll()
             if self.log_tail.boss_seen:
                 logging.info("日志已识别 BOSS 实体 %s。", self.cfg["combat"]["boss_entity_id"])
             if self.log_tail.boss_dead:
                 logging.info("日志确认 BOSS 已死亡。")
                 return
-            if any("角色死亡" in line or "玩家死亡" in line for line in lines):
-                raise RuntimeError("日志检测到角色死亡，MVP 暂停。")
             self.wait(self.cfg["combat"]["attack_interval_seconds"])
+            if self.revive_epoch != revive_epoch:
+                deadline = time.monotonic() + self.cfg["timing"]["boss_timeout_seconds"]
+                revive_epoch = self.revive_epoch
         raise RuntimeError("BOSS 战超时，未从日志检测到 BOSS 死亡。")
 
     def pickup_and_exit(self) -> None:
