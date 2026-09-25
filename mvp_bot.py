@@ -18,7 +18,9 @@ import numpy as np
 from PIL import ImageGrab
 import win32api
 import win32con
+import win32event
 import win32gui
+import winerror
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -166,6 +168,16 @@ class GameWindow:
         time.sleep(hold_seconds)
         win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
 
+    def release_keys(self, names: tuple[str, ...], live: bool = True) -> None:
+        if not live:
+            logging.info("DRY release keys %s", ", ".join(names))
+            return
+        # 不在前台时不向其他程序发送全局 KEYUP。
+        if not self.is_foreground():
+            return
+        for name in names:
+            win32api.keybd_event(VK[name.upper()], 0, win32con.KEYEVENTF_KEYUP, 0)
+
 
 class LogTail:
     def __init__(self, path: str):
@@ -275,6 +287,7 @@ class Bot:
         self.running = False
         self.stopped = False
         self.last_fatigue: Optional[int] = None
+        self.phase = "idle"
         self._f8_down = False
         self._f12_down = False
 
@@ -291,6 +304,7 @@ class Bot:
         if f12_down and not self._f12_down:
             self.stopped = True
             self.running = False
+            self.window.release_keys(("A", "SPACE"), live=self.live)
             logging.warning("收到 F12，立即停止。")
             winsound.Beep(500, 300)
         self._f12_down = f12_down
@@ -298,6 +312,8 @@ class Bot:
         f8_down = pressed(VK["F8"])
         if f8_down and not self._f8_down and not self.stopped:
             self.running = not self.running
+            if not self.running:
+                self.window.release_keys(("A", "SPACE"), live=self.live)
             logging.info("%s", "开始" if self.running else "暂停")
             winsound.Beep(900 if self.running else 600, 180)
         self._f8_down = f8_down
@@ -325,6 +341,19 @@ class Bot:
             raise RuntimeError(f"坐标 {name} 尚未校准，请先运行 --calibrate。")
         logging.info("点击 %s -> %s", name, point)
         self.window.click_normalized(point, live=self.live)
+
+    def set_phase(self, name: str, combat: bool = False) -> None:
+        if self.phase == name:
+            return
+        logging.info("阶段切换：%s -> %s", self.phase, name)
+        self.phase = name
+        if not combat:
+            self.window.release_keys(("A", "SPACE"), live=self.live)
+
+    def tap_combat_key(self, name: str, hold_seconds: float = 0.05) -> None:
+        if self.phase not in ("normal_combat", "boss_combat"):
+            raise RuntimeError(f"输入隔离阻止了在 {self.phase} 阶段发送战斗按键 {name}。")
+        self.window.tap_key(name, hold_seconds=hold_seconds, live=self.live)
 
     def template_match(
         self, frame: np.ndarray, template: Optional[np.ndarray]
@@ -414,6 +443,7 @@ class Bot:
 
     def normal_farm_until_low(self) -> None:
         logging.info("状态：普通区域挂机。")
+        self.set_phase("normal_combat", combat=True)
         combat = self.cfg["combat"]
         next_attack = 0.0
         next_pickup = 0.0
@@ -432,10 +462,10 @@ class Bot:
                 continue
             now = time.monotonic()
             if now >= next_attack:
-                self.window.tap_key(combat["attack_key"], live=self.live)
+                self.tap_combat_key(combat["attack_key"])
                 next_attack = now + combat["attack_interval_seconds"]
             if now >= next_pickup:
-                self.window.tap_key(combat["pickup_key"], live=self.live)
+                self.tap_combat_key(combat["pickup_key"])
                 next_pickup = now + combat["pickup_interval_seconds"]
             if now >= next_fatigue:
                 fatigue = self.read_fatigue()
@@ -447,6 +477,8 @@ class Bot:
 
     def travel_to_first_entrance(self) -> None:
         logging.info("状态：通过普通地图寻路到副本入口。")
+        self.set_phase("normal_navigation")
+        self.wait(self.cfg["timing"].get("combat_input_quiet_seconds", 1.0))
         self.click("map_button")
         self.wait(self.cfg["timing"]["map_open_seconds"])
         self.click("normal_portal_marker")
@@ -454,12 +486,14 @@ class Bot:
 
     def enter_dungeon(self) -> None:
         logging.info("状态：触发入口并进入冰牙海湾。")
+        self.set_phase("entering_dungeon")
         self.trigger_entrance_panel()
         self.click("enter_dungeon_button")
         self.wait(self.cfg["timing"]["dungeon_load_seconds"])
 
     def travel_to_boss(self) -> None:
         logging.info("状态：副本内地图寻路到 BOSS。")
+        self.set_phase("dungeon_navigation")
         self.click("map_button")
         self.wait(self.cfg["timing"]["map_open_seconds"])
         self.click("dungeon_boss_marker")
@@ -467,14 +501,12 @@ class Bot:
 
     def fight_boss(self) -> None:
         logging.info("状态：寻找并攻击 BOSS。")
+        self.set_phase("boss_combat", combat=True)
         self.log_tail.boss_seen = False
         self.log_tail.boss_dead = False
         deadline = time.monotonic() + self.cfg["timing"]["boss_timeout_seconds"]
         while time.monotonic() < deadline and not self.stopped:
-            self.window.tap_key(
-                self.cfg["combat"]["attack_key"],
-                live=self.live,
-            )
+            self.tap_combat_key(self.cfg["combat"]["attack_key"])
             lines = self.log_tail.poll()
             if self.log_tail.boss_seen:
                 logging.info("日志已识别 BOSS 实体 %s。", self.cfg["combat"]["boss_entity_id"])
@@ -488,6 +520,7 @@ class Bot:
 
     def pickup_and_exit(self) -> None:
         logging.info("状态：拾取 BOSS 掉落。")
+        self.set_phase("boss_loot")
         self.window.tap_key(
             self.cfg["combat"]["pickup_key"],
             hold_seconds=self.cfg["combat"]["boss_pickup_hold_seconds"],
@@ -495,6 +528,7 @@ class Bot:
         )
         self.wait(1.5)
         logging.info("状态：退出副本。")
+        self.set_phase("exiting_dungeon")
         self.click("exit_dungeon_button")
         self.wait(0.8)
         self.click("confirm_exit_button")
@@ -564,6 +598,7 @@ class Bot:
                     if not self.stopped:
                         self.boss_recovery_loop()
             except RuntimeError as exc:
+                self.window.release_keys(("A", "SPACE"), live=self.live)
                 logging.exception("自动流程暂停：%s", exc)
                 print(f"\n自动流程暂停：{exc}")
                 self.running = False
@@ -656,6 +691,9 @@ def main() -> int:
     if args.ocr_test:
         ocr_test(cfg)
         return 0
+    instance_mutex = win32event.CreateMutex(None, False, "Local\\CuriousBeastAutomationMVP")
+    if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+        raise RuntimeError("已有一个挂机脚本正在运行，请先按 F12 关闭旧实例。")
     mode = args.mode
     if mode is None:
         print("请选择运行模式：")
@@ -665,6 +703,7 @@ def main() -> int:
         mode = "dungeon" if choice == "2" else "full"
     bot = Bot(cfg, live=args.live, mode=mode)
     bot.run()
+    win32api.CloseHandle(instance_mutex)
     return 0
 
 
