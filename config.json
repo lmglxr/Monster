@@ -21,8 +21,8 @@
   },
   "coordinates": {
     "map_button": [
-      0.61875,
-      0.318056
+      0.917969,
+      0.161111
     ],
     "normal_portal_marker": [
       0.400781,
@@ -82,6 +82,10 @@
     "max_circle_rounds": 3,
     "portal_match_threshold": 0.5,
     "panel_match_threshold": 0.62
+  },
+  "map_detection": {
+    "open_match_threshold": 0.52,
+    "open_retries": 3
   },
   "log_path": "../Logs/Player.log"
 }

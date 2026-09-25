@@ -284,6 +284,7 @@ class Bot:
         self.ocr: Optional[FatigueOCR] = None
         self.portal_template = self._load_gray_template("portal.png")
         self.panel_template = self._load_gray_template("entry_panel_title.png")
+        self.map_template = self._load_gray_template("map_open_indicator.png")
         self.running = False
         self.stopped = False
         self.last_fatigue: Optional[int] = None
@@ -380,6 +381,26 @@ class Bot:
         _, score = self.template_match(self.window.capture(), self.panel_template)
         logging.debug("副本面板匹配分数 %.3f", score)
         return score >= self.cfg["entrance"]["panel_match_threshold"]
+
+    def map_visible(self) -> bool:
+        _, score = self.template_match(self.window.capture(), self.map_template)
+        logging.info("地图打开状态匹配分数 %.3f", score)
+        return score >= self.cfg["map_detection"]["open_match_threshold"]
+
+    def open_map(self) -> None:
+        if self.map_visible():
+            logging.info("地图已经打开，无需重复点击小地图。")
+            return
+        retries = max(1, int(self.cfg["map_detection"].get("open_retries", 3)))
+        for attempt in range(1, retries + 1):
+            logging.info("点击右上角小地图并验证地图界面，第 %s/%s 次。", attempt, retries)
+            self.click("map_button")
+            if not self.wait(self.cfg["timing"]["map_open_seconds"]):
+                return
+            if self.map_visible():
+                logging.info("已确认地图界面打开。")
+                return
+        raise RuntimeError("点击小地图后仍未检测到地图界面；请运行“重新校准小地图.bat”。")
 
     def find_portal(self) -> tuple[int, int]:
         deadline = time.monotonic() + 25.0
@@ -479,8 +500,7 @@ class Bot:
         logging.info("状态：通过普通地图寻路到副本入口。")
         self.set_phase("normal_navigation")
         self.wait(self.cfg["timing"].get("combat_input_quiet_seconds", 1.0))
-        self.click("map_button")
-        self.wait(self.cfg["timing"]["map_open_seconds"])
+        self.open_map()
         self.click("normal_portal_marker")
         self.wait(self.cfg["timing"]["normal_auto_path_seconds"])
 
@@ -494,8 +514,7 @@ class Bot:
     def travel_to_boss(self) -> None:
         logging.info("状态：副本内地图寻路到 BOSS。")
         self.set_phase("dungeon_navigation")
-        self.click("map_button")
-        self.wait(self.cfg["timing"]["map_open_seconds"])
+        self.open_map()
         self.click("dungeon_boss_marker")
         self.wait(self.cfg["timing"]["boss_auto_path_seconds"])
 
@@ -651,6 +670,28 @@ def calibrate(cfg: dict) -> None:
     print(f"校准完成，已保存到 {CONFIG_PATH}")
 
 
+def calibrate_map_button(cfg: dict) -> None:
+    window = GameWindow(cfg["window_title"])
+    window.locate()
+    w, h = window.client_size()
+    print(f"找到游戏客户区：{w}x{h}")
+    print("请先关闭地图界面，回到正常 HUD。")
+    print("把鼠标放到右上角圆形小地图的中心；这里是用于展开地图的入口，不是地图窗口内的坐标。")
+    print("按 F2 记录，按 F12 取消。校准过程不会自动点击。")
+    winsound.Beep(750, 120)
+    if not wait_key_edge(VK["F2"]):
+        print("已取消小地图校准。")
+        return
+    sx, sy = win32api.GetCursorPos()
+    cx, cy = win32gui.ScreenToClient(window.hwnd, (sx, sy))
+    if not (0 <= cx < w and 0 <= cy < h):
+        raise RuntimeError(f"记录点 ({cx}, {cy}) 不在游戏客户区内。")
+    cfg["coordinates"]["map_button"] = window.client_to_normalized((cx, cy))
+    save_config(cfg)
+    winsound.Beep(1000, 250)
+    print(f"小地图位置已记录：客户区 ({cx}, {cy})，配置 {cfg['coordinates']['map_button']}")
+
+
 def ocr_test(cfg: dict) -> None:
     window = GameWindow(cfg["window_title"])
     window.locate()
@@ -667,6 +708,7 @@ def ocr_test(cfg: dict) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Curious Beast 外部挂机 MVP")
     parser.add_argument("--calibrate", action="store_true", help="运行一次性坐标校准")
+    parser.add_argument("--calibrate-map", action="store_true", help="只重新校准右上角小地图")
     parser.add_argument("--ocr-test", action="store_true", help="只测试疲劳 OCR")
     parser.add_argument("--live", action="store_true", help="允许真实发送输入；否则为演练模式")
     parser.add_argument(
@@ -687,6 +729,9 @@ def main() -> int:
     cfg = load_config()
     if args.calibrate:
         calibrate(cfg)
+        return 0
+    if args.calibrate_map:
+        calibrate_map_button(cfg)
         return 0
     if args.ocr_test:
         ocr_test(cfg)
