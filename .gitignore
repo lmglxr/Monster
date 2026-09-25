@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+
+# Runtime diagnostics are local-only and may grow over time.
+debug/
+runtime.log
+

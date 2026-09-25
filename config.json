@@ -1,0 +1,79 @@
+{
+  "window_title": "CreatureCurios",
+  "reference_client_size": [
+    1280,
+    720
+  ],
+  "fatigue": {
+    "low_threshold": -900,
+    "boss_target": 800,
+    "check_interval_seconds": 30,
+    "hover_point": [
+      0.944531,
+      0.965278
+    ],
+    "ocr_region": [
+      0.74,
+      0.68,
+      0.998,
+      0.94
+    ]
+  },
+  "coordinates": {
+    "map_button": [
+      0.61875,
+      0.318056
+    ],
+    "normal_portal_marker": [
+      0.400781,
+      0.279167
+    ],
+    "enter_dungeon_button": [
+      0.503906,
+      0.7125
+    ],
+    "dungeon_boss_marker": [
+      0.563281,
+      0.379167
+    ],
+    "exit_dungeon_button": [
+      0.822656,
+      0.165278
+    ],
+    "confirm_exit_button": [
+      0.483594,
+      0.538889
+    ]
+  },
+  "combat": {
+    "attack_key": "A",
+    "attack_interval_seconds": 0.45,
+    "pickup_key": "SPACE",
+    "pickup_interval_seconds": 1.5,
+    "boss_pickup_hold_seconds": 1.0,
+    "boss_entity_id": 100043,
+    "boss_max_hp": 18000
+  },
+  "scenes": {
+    "normal_scene_id": 1002,
+    "boss_scene_id_is_dynamic": true
+  },
+  "timing": {
+    "map_open_seconds": 1.0,
+    "normal_auto_path_seconds": 12.0,
+    "dungeon_load_seconds": 8.0,
+    "boss_auto_path_seconds": 16.0,
+    "boss_timeout_seconds": 150.0,
+    "exit_load_seconds": 9.0,
+    "panel_wait_seconds": 0.5,
+    "circle_click_interval_seconds": 0.35
+  },
+  "entrance": {
+    "circle_radius_pixels_at_1280x720": 62,
+    "circle_points": 12,
+    "max_circle_rounds": 3,
+    "portal_match_threshold": 0.5,
+    "panel_match_threshold": 0.62
+  },
+  "log_path": "../Logs/Player.log"
+}
