@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import time
+import warnings
 import winsound
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,7 +38,9 @@ VK = {
     "F12": win32con.VK_F12,
 }
 
-FATIGUE_RE = re.compile(r"(-?\d{1,4})\s*/\s*1000")
+# 游戏会把疲劳范围显示成 -1000；EasyOCR 有时又会漏掉分母前的负号。
+# 两种结果都接受，例如 -67/-1000、-255/1000、800/-1000。
+FATIGUE_RE = re.compile(r"(-?\d{1,4})\s*/\s*-?1000")
 COMBAT_RE = re.compile(
     r"场景:(\d+)\s+当前场景:(\d+)\s+目标:(\d+).*?HP:(\d+).*?生命:(\w+)"
 )
@@ -226,6 +229,11 @@ class FatigueOCR:
         import easyocr
 
         logging.info("正在加载 EasyOCR 数字识别模型……")
+        warnings.filterwarnings(
+            "ignore",
+            message=r"'pin_memory' argument is set as true but no accelerator is found.*",
+            category=UserWarning,
+        )
         self.reader = easyocr.Reader(["en"], gpu=False, verbose=False)
         self.debug_cfg = debug_cfg or {}
         self.last_debug_save = 0.0
