@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import logging
 import math
@@ -258,25 +259,86 @@ class FatigueOCR:
             except OSError:
                 logging.warning("无法删除旧调试截图：%s", stale)
 
-    def read(self, frame: np.ndarray, region: list[float]) -> tuple[Optional[int], list[str]]:
+    @staticmethod
+    def _crop(frame: np.ndarray, region: list[float]) -> np.ndarray:
         h, w = frame.shape[:2]
         x1, y1, x2, y2 = region
-        crop = frame[int(y1 * h):int(y2 * h), int(x1 * w):int(x2 * w)]
-        if crop.size == 0:
-            return None, []
-        crop = cv2.resize(crop, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
-        texts = self.reader.readtext(
-            crop,
+        return frame[int(y1 * h):int(y2 * h), int(x1 * w):int(x2 * w)]
+
+    @staticmethod
+    def _extract_value(texts: list[str]) -> Optional[int]:
+        joined = " ".join(texts)
+        match = FATIGUE_RE.search(joined)
+        if not match:
+            return None
+        value = int(match.group(1))
+        return value if -1000 <= value <= 1000 else None
+
+    def _recognize(self, image: np.ndarray, scale: float = 2.5) -> list[str]:
+        enlarged = cv2.resize(
+            image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+        )
+        return self.reader.readtext(
+            enlarged,
             detail=0,
             paragraph=False,
             allowlist="0123456789/-:",
         )
-        joined = " ".join(texts)
-        match = FATIGUE_RE.search(joined)
-        if match:
-            return int(match.group(1)), texts
-        self._save_failure(crop)
-        return None, texts
+
+    def read(
+        self,
+        frame: np.ndarray,
+        region: list[float],
+        value_region: Optional[list[float]] = None,
+    ) -> tuple[Optional[int], list[str]]:
+        crop = self._crop(frame, region)
+        if crop.size == 0:
+            return None, []
+
+        # 先只识别提示框第一行。疲劳数值为红色，使用 R-max(G,B) 可以消除
+        # 灰色说明文字和冰面背景；这对 989/1000、805/1000 一类红字明显更稳。
+        if value_region is None:
+            value_region = [0.895, 0.785, 0.998, 0.835]
+        value_crop = self._crop(frame, value_region)
+        diagnostic_texts: list[str] = []
+        candidates: list[int] = []
+        if value_crop.size:
+            red = value_crop[:, :, 2].astype(np.float32)
+            green_blue = np.maximum(value_crop[:, :, 1], value_crop[:, :, 0]).astype(
+                np.float32
+            )
+            red_difference = cv2.normalize(
+                red - green_blue, None, 0, 255, cv2.NORM_MINMAX
+            ).astype(np.uint8)
+            red_texts = self._recognize(red_difference, scale=4.0)
+            diagnostic_texts.extend(f"red:{text}" for text in red_texts)
+            value = self._extract_value(red_texts)
+            if value is not None:
+                candidates.append(value)
+
+            focused_texts = self._recognize(value_crop, scale=4.0)
+            diagnostic_texts.extend(f"focus:{text}" for text in focused_texts)
+            value = self._extract_value(focused_texts)
+            if value is not None:
+                candidates.append(value)
+
+        # 保留原来的整块提示框识别作为兼容兜底。
+        texts = self._recognize(crop)
+        diagnostic_texts.extend(texts)
+        value = self._extract_value(texts)
+        if value is not None:
+            candidates.append(value)
+        if candidates:
+            # 红色增强偶尔会漏掉很细的负号；原图/整框两路一致时由多数票纠正。
+            counts = Counter(candidates)
+            selected = max(
+                enumerate(candidates), key=lambda item: (counts[item[1]], -item[0])
+            )[1]
+            return selected, diagnostic_texts
+        self._save_failure(
+            cv2.resize(crop, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+        )
+        return None, diagnostic_texts
 
 
 class Bot:
@@ -587,7 +649,11 @@ class Bot:
         values: list[int] = []
         for _ in range(attempts):
             frame = self.window.capture()
-            value, texts = self.ocr.read(frame, self.cfg["fatigue"]["ocr_region"])
+            value, texts = self.ocr.read(
+                frame,
+                self.cfg["fatigue"]["ocr_region"],
+                self.cfg["fatigue"].get("value_region"),
+            )
             logging.info("疲劳 OCR: value=%s raw=%s", value, texts)
             if value is not None and -1000 <= value <= 1000:
                 values.append(value)
@@ -859,7 +925,11 @@ def ocr_test(cfg: dict) -> None:
     time.sleep(2)
     window.move_client(*hover, live=True)
     time.sleep(0.8)
-    value, texts = reader.read(window.capture(), cfg["fatigue"]["ocr_region"])
+    value, texts = reader.read(
+        window.capture(),
+        cfg["fatigue"]["ocr_region"],
+        cfg["fatigue"].get("value_region"),
+    )
     print(f"识别结果：{value}/1000；原始OCR：{texts}")
 
 

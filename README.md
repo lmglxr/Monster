@@ -82,6 +82,8 @@ Space持续1秒 → 点击退出 → 点击确认
 
 - 工具日志：`runtime.log`
 - OCR失败截图：`debug/ocr_failed_*.png`
+- 疲劳 OCR 会优先只读取提示框第一行，并通过红色通道增强数值；整块提示框识别仅作为兜底，日志中 `red:` 和 `focus:` 分别代表红字增强与第一行原图结果。
+- 红字精确区域默认使用客户区归一化坐标 `[0.895, 0.785, 0.998, 0.835]`；如果以后更改游戏 UI 缩放，可在 `fatigue.value_region` 中覆盖。
 - OCR 失败图不是逐帧保存：默认至少间隔 60 秒，最多保留最新 20 张；两项均可在 `config.json` 的 `debug` 段调整。
 - 如果入口模板识别失败，可以在 `config.json` 中降低 `portal_match_threshold`，但不建议低于 `0.42`。
 - 如果自动寻路尚未完成就执行下一步，可增加 `normal_auto_path_seconds` 或 `boss_auto_path_seconds`。
