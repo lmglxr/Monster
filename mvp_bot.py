@@ -210,11 +210,33 @@ class LogTail:
 
 
 class FatigueOCR:
-    def __init__(self) -> None:
+    def __init__(self, debug_cfg: Optional[dict] = None) -> None:
         import easyocr
 
         logging.info("正在加载 EasyOCR 数字识别模型……")
         self.reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+        self.debug_cfg = debug_cfg or {}
+        self.last_debug_save = 0.0
+
+    def _save_failure(self, crop: np.ndarray) -> None:
+        now = time.time()
+        min_interval = float(self.debug_cfg.get("ocr_failure_min_interval_seconds", 60))
+        if now - self.last_debug_save < min_interval:
+            return
+        self.last_debug_save = now
+        DEBUG_DIR.mkdir(exist_ok=True)
+        cv2.imwrite(str(DEBUG_DIR / f"ocr_failed_{int(now)}.png"), crop)
+        limit = max(1, int(self.debug_cfg.get("max_ocr_failure_images", 20)))
+        images = sorted(
+            DEBUG_DIR.glob("ocr_failed_*.png"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in images[limit:]:
+            try:
+                stale.unlink()
+            except OSError:
+                logging.warning("无法删除旧调试截图：%s", stale)
 
     def read(self, frame: np.ndarray, region: list[float]) -> tuple[Optional[int], list[str]]:
         h, w = frame.shape[:2]
@@ -233,20 +255,21 @@ class FatigueOCR:
         match = FATIGUE_RE.search(joined)
         if match:
             return int(match.group(1)), texts
-        DEBUG_DIR.mkdir(exist_ok=True)
-        cv2.imwrite(str(DEBUG_DIR / f"ocr_failed_{int(time.time())}.png"), crop)
+        self._save_failure(crop)
         return None, texts
 
 
 class Bot:
-    def __init__(self, cfg: dict, live: bool):
+    def __init__(self, cfg: dict, live: bool, mode: str):
         self.cfg = cfg
         self.live = live
+        self.mode = mode
         self.window = GameWindow(cfg["window_title"])
         self.window.locate()
         self.log_tail = LogTail(cfg["log_path"])
         self.log_tail.start_at_end()
-        self.ocr = FatigueOCR()
+        # OCR 模型占用明显高于其余模块；延迟到完整闭环真正读取疲劳时再加载。
+        self.ocr: Optional[FatigueOCR] = None
         self.portal_template = self._load_gray_template("portal.png")
         self.panel_template = self._load_gray_template("entry_panel_title.png")
         self.running = False
@@ -368,6 +391,8 @@ class Bot:
         raise RuntimeError("绕入口移动后仍未检测到副本面板。")
 
     def read_fatigue(self, attempts: int = 3) -> Optional[int]:
+        if self.ocr is None:
+            self.ocr = FatigueOCR(self.cfg.get("debug"))
         hover = self.window.normalized_to_client(self.cfg["fatigue"]["hover_point"])
         self.window.move_client(*hover, live=self.live)
         self.wait(0.8)
@@ -476,15 +501,19 @@ class Bot:
         self.wait(self.cfg["timing"]["exit_load_seconds"])
 
     def boss_recovery_loop(self) -> None:
-        first = True
+        completed_runs = 0
+        minimum_runs = max(1, int(self.cfg.get("boss_loop", {}).get("minimum_runs", 8)))
         while not self.stopped:
-            if first:
-                self.travel_to_first_entrance()
-                first = False
+            # 每次退出都会回到普通地图，因此每一轮都重新用地图寻路到入口。
+            self.travel_to_first_entrance()
             self.enter_dungeon()
             self.travel_to_boss()
             self.fight_boss()
             self.pickup_and_exit()
+            completed_runs += 1
+            logging.info("本轮疲劳恢复已完成 %s 次副本（至少 %s 次）。", completed_runs, minimum_runs)
+            if completed_runs < minimum_runs:
+                continue
             fatigue = self.read_fatigue()
             if fatigue is None:
                 raise RuntimeError("退出副本后无法识别疲劳值，已安全暂停。")
@@ -492,6 +521,18 @@ class Bot:
                 logging.info("疲劳已恢复到 %s，结束 BOSS 循环。", fatigue)
                 return
             logging.info("疲劳仍为 %s，准备再次进入副本。", fatigue)
+
+    def dungeon_only_loop(self) -> None:
+        completed_runs = 0
+        logging.info("状态：只刷副本；不会读取疲劳，也不会返回普通挂机。")
+        while not self.stopped:
+            self.travel_to_first_entrance()
+            self.enter_dungeon()
+            self.travel_to_boss()
+            self.fight_boss()
+            self.pickup_and_exit()
+            completed_runs += 1
+            logging.info("只刷副本模式已完成 %s 次。", completed_runs)
 
     def run(self) -> None:
         required = [
@@ -508,16 +549,20 @@ class Bot:
         w, h = self.window.client_size()
         logging.info("已连接游戏窗口，客户区 %sx%s，live=%s", w, h, self.live)
         print("准备完成。请切到游戏窗口，按 F8 开始/暂停，按 F12 立即停止。")
-        print("当前模式：" + ("实时输入" if self.live else "演练（不发送输入）"))
+        mode_text = "完整闭环" if self.mode == "full" else "只刷副本"
+        print("当前模式：" + mode_text + " / " + ("实时输入" if self.live else "演练（不发送输入）"))
         while not self.stopped:
             self.check_control_keys()
             if not self.running:
                 time.sleep(0.05)
                 continue
             try:
-                self.normal_farm_until_low()
-                if not self.stopped:
-                    self.boss_recovery_loop()
+                if self.mode == "dungeon":
+                    self.dungeon_only_loop()
+                else:
+                    self.normal_farm_until_low()
+                    if not self.stopped:
+                        self.boss_recovery_loop()
             except RuntimeError as exc:
                 logging.exception("自动流程暂停：%s", exc)
                 print(f"\n自动流程暂停：{exc}")
@@ -574,7 +619,7 @@ def calibrate(cfg: dict) -> None:
 def ocr_test(cfg: dict) -> None:
     window = GameWindow(cfg["window_title"])
     window.locate()
-    reader = FatigueOCR()
+    reader = FatigueOCR(cfg.get("debug"))
     hover = window.normalized_to_client(cfg["fatigue"]["hover_point"])
     print("请保持游戏在前台。程序将把鼠标移到疲劳条并读取提示框。")
     time.sleep(2)
@@ -589,6 +634,11 @@ def main() -> int:
     parser.add_argument("--calibrate", action="store_true", help="运行一次性坐标校准")
     parser.add_argument("--ocr-test", action="store_true", help="只测试疲劳 OCR")
     parser.add_argument("--live", action="store_true", help="允许真实发送输入；否则为演练模式")
+    parser.add_argument(
+        "--mode",
+        choices=("full", "dungeon"),
+        help="full=普通挂机与疲劳恢复闭环；dungeon=只刷副本",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -606,7 +656,14 @@ def main() -> int:
     if args.ocr_test:
         ocr_test(cfg)
         return 0
-    bot = Bot(cfg, live=args.live)
+    mode = args.mode
+    if mode is None:
+        print("请选择运行模式：")
+        print("  1. 完整闭环（普通挂机 -> 疲劳低于阈值 -> 至少 8 次副本 -> 返回挂机）")
+        print("  2. 只刷副本（持续重复进入、击杀、拾取、退出）")
+        choice = input("输入 1 或 2，直接回车默认 1：").strip()
+        mode = "dungeon" if choice == "2" else "full"
+    bot = Bot(cfg, live=args.live, mode=mode)
     bot.run()
     return 0
 

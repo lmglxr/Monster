@@ -1,5 +1,5 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-python mvp_bot.py --mode full
+python mvp_bot.py --live --mode dungeon
 pause

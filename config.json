@@ -5,9 +5,9 @@
     720
   ],
   "fatigue": {
-    "low_threshold": -900,
+    "low_threshold": -800,
     "boss_target": 800,
-    "check_interval_seconds": 30,
+    "check_interval_seconds": 300,
     "hover_point": [
       0.944531,
       0.965278
@@ -67,6 +67,13 @@
     "exit_load_seconds": 9.0,
     "panel_wait_seconds": 0.5,
     "circle_click_interval_seconds": 0.35
+  },
+  "boss_loop": {
+    "minimum_runs": 8
+  },
+  "debug": {
+    "ocr_failure_min_interval_seconds": 60,
+    "max_ocr_failure_images": 20
   },
   "entrance": {
     "circle_radius_pixels_at_1280x720": 62,
