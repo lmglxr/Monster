@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import ctypes
 import json
 import logging
 import math
@@ -22,6 +23,7 @@ import win32api
 import win32con
 import win32event
 import win32gui
+import win32process
 import winerror
 
 
@@ -34,34 +36,39 @@ DEBUG_DIR = APP_DIR / "debug"
 VK = {
     "A": 0x41,
     "SPACE": win32con.VK_SPACE,
+    "ESC": win32con.VK_ESCAPE,
     "F2": win32con.VK_F2,
     "F8": win32con.VK_F8,
     "F12": win32con.VK_F12,
 }
 
-# 游戏会把疲劳范围显示成 -1000；EasyOCR 有时又会漏掉分母前的负号。
-# 两种结果都接受，例如 -67/-1000、-255/1000、800/-1000。
-FATIGUE_RE = re.compile(r"(-?\d{1,4})\s*/\s*-?1000")
+# 游戏用分母表示疲劳所在的正负区间：xxx/1000 为正，xxx/-1000 为负。
+# 数字左侧的文字残影偶尔会被 EasyOCR 误认成负号，因此忽略分子符号，
+# 只根据分母前是否存在负号决定最终结果的正负。
+FATIGUE_RE = re.compile(r"(?<!\d)-?(\d{1,4})\s*/\s*(-?)\s*1000\b")
 COMBAT_RE = re.compile(
     r"场景:(\d+)\s+当前场景:(\d+)\s+目标:(\d+).*?HP:(\d+).*?生命:(\w+)"
 )
+SCENE_RE = re.compile(r"当前场景:(\d+)")
 
 
 def load_config() -> dict:
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
         cfg = json.load(f)
-    raw_log_path = Path(cfg["log_path"])
-    if not raw_log_path.is_absolute():
+    raw_log_value = str(cfg.get("log_path", "auto")).strip()
+    raw_log_path = Path(raw_log_value)
+    if raw_log_value.lower() != "auto" and not raw_log_path.is_absolute():
         cfg["log_path"] = str((APP_DIR / raw_log_path).resolve())
     return cfg
 
 
 def save_config(cfg: dict) -> None:
     saved = dict(cfg)
-    try:
-        saved["log_path"] = os.path.relpath(cfg["log_path"], APP_DIR).replace("\\", "/")
-    except ValueError:
-        pass
+    if str(cfg.get("log_path", "auto")).lower() != "auto":
+        try:
+            saved["log_path"] = os.path.relpath(cfg["log_path"], APP_DIR).replace("\\", "/")
+        except ValueError:
+            pass
     with CONFIG_PATH.open("w", encoding="utf-8") as f:
         json.dump(saved, f, ensure_ascii=False, indent=2)
         f.write("\n")
@@ -89,22 +96,51 @@ def wait_key_edge(vk: int, stop_vk: int = VK["F12"]) -> bool:
 class GameWindow:
     title: str
     hwnd: int = 0
+    reconnect_attempts: int = 1
+    reconnect_interval_seconds: float = 2.0
+    capture_retries: int = 5
+    capture_retry_seconds: float = 0.5
+    reconnect_epoch: int = 0
 
-    def locate(self) -> None:
-        candidates: list[int] = []
+    def locate(self, attempts: Optional[int] = None) -> None:
+        attempts = max(1, int(attempts or self.reconnect_attempts))
+        previous_hwnd = self.hwnd
+        previous_was_valid = bool(previous_hwnd and win32gui.IsWindow(previous_hwnd))
+        candidate_count = 0
 
-        def callback(hwnd: int, _: object) -> None:
-            if not win32gui.IsWindowVisible(hwnd):
+        for attempt in range(1, attempts + 1):
+            candidates: list[int] = []
+
+            def callback(hwnd: int, _: object) -> None:
+                if not win32gui.IsWindowVisible(hwnd):
+                    return
+                if win32gui.GetWindowText(hwnd).strip().lower() == self.title.lower():
+                    candidates.append(hwnd)
+
+            win32gui.EnumWindows(callback, None)
+            candidate_count = len(candidates)
+            if candidate_count == 1:
+                self.hwnd = candidates[0]
+                if previous_hwnd and (
+                    not previous_was_valid or previous_hwnd != self.hwnd
+                ):
+                    self.reconnect_epoch += 1
+                    logging.warning(
+                        "已重新连接游戏窗口（第 %s/%s 次查找）。", attempt, attempts
+                    )
                 return
-            if win32gui.GetWindowText(hwnd).strip().lower() == self.title.lower():
-                candidates.append(hwnd)
-
-        win32gui.EnumWindows(callback, None)
-        if len(candidates) != 1:
-            raise RuntimeError(
-                f"需要且只能找到一个标题为 {self.title!r} 的窗口，当前找到 {len(candidates)} 个。"
-            )
-        self.hwnd = candidates[0]
+            if attempt < attempts:
+                logging.warning(
+                    "暂时无法唯一定位游戏窗口（找到 %s 个），%.1f 秒后重试 %s/%s。",
+                    candidate_count,
+                    self.reconnect_interval_seconds,
+                    attempt + 1,
+                    attempts,
+                )
+                time.sleep(self.reconnect_interval_seconds)
+        raise RuntimeError(
+            f"连续 {attempts} 次查找后，仍无法唯一定位标题为 {self.title!r} 的窗口；当前找到 {candidate_count} 个。"
+        )
 
     def ensure(self) -> None:
         if not self.hwnd or not win32gui.IsWindow(self.hwnd):
@@ -123,16 +159,69 @@ class GameWindow:
         self.ensure()
         return win32gui.GetForegroundWindow() == self.hwnd
 
+    def executable_path(self) -> Path:
+        """Return the executable behind the game window without assuming Steam's path."""
+        self.ensure()
+        _, process_id = win32process.GetWindowThreadProcessId(self.hwnd)
+        process = win32api.OpenProcess(0x1000, False, process_id)
+        try:
+            buffer = ctypes.create_unicode_buffer(32768)
+            size = ctypes.c_ulong(len(buffer))
+            query = ctypes.windll.kernel32.QueryFullProcessImageNameW
+            query.argtypes = (
+                ctypes.c_void_p,
+                ctypes.c_ulong,
+                ctypes.c_wchar_p,
+                ctypes.POINTER(ctypes.c_ulong),
+            )
+            query.restype = ctypes.c_int
+            if not query(
+                ctypes.c_void_p(int(process)), 0, buffer, ctypes.byref(size)
+            ):
+                raise ctypes.WinError()
+            return Path(buffer.value).resolve()
+        finally:
+            win32api.CloseHandle(process)
+
     def require_foreground(self) -> None:
         if not self.is_foreground():
             raise RuntimeError("游戏不在前台，已暂停发送输入。切回游戏后按 F8 继续。")
 
     def capture(self) -> np.ndarray:
-        self.ensure()
-        x, y = self.client_origin()
-        w, h = self.client_size()
-        image = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
-        return cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
+        last_error: Optional[Exception] = None
+        retries = max(1, int(self.capture_retries))
+        for attempt in range(1, retries + 1):
+            try:
+                self.ensure()
+                x, y = self.client_origin()
+                w, h = self.client_size()
+                if w <= 0 or h <= 0:
+                    raise RuntimeError(f"游戏客户区尺寸无效：{w}x{h}")
+                image = ImageGrab.grab(
+                    bbox=(x, y, x + w, y + h), all_screens=True
+                )
+                pixels = np.asarray(image)
+                if pixels.size == 0:
+                    raise RuntimeError("游戏窗口截图为空")
+                return cv2.cvtColor(pixels, cv2.COLOR_RGB2BGR)
+            except (OSError, ValueError, RuntimeError, cv2.error) as exc:
+                last_error = exc
+                if attempt >= retries:
+                    break
+                logging.warning(
+                    "游戏截图失败：%s；%.1f 秒后重新获取窗口并重试 %s/%s。",
+                    exc,
+                    self.capture_retry_seconds,
+                    attempt + 1,
+                    retries,
+                )
+                # 保留旧句柄供 locate 判断这是一次重连，并强制重新枚举窗口。
+                time.sleep(self.capture_retry_seconds)
+                reconnect_epoch = self.reconnect_epoch
+                self.locate()
+                if self.reconnect_epoch == reconnect_epoch:
+                    self.reconnect_epoch += 1
+        raise RuntimeError(f"连续 {retries} 次游戏截图失败：{last_error}")
 
     def normalized_to_client(self, point: list[float]) -> tuple[int, int]:
         w, h = self.client_size()
@@ -176,8 +265,13 @@ class GameWindow:
         if not live:
             logging.info("DRY release keys %s", ", ".join(names))
             return
-        # 不在前台时不向其他程序发送全局 KEYUP。
-        if not self.is_foreground():
+        # 释放按键不能因窗口暂时消失而阻塞 F12 停止流程；句柄无效或不在
+        # 前台时直接跳过，避免把全局 KEYUP 发送给其他程序。
+        if (
+            not self.hwnd
+            or not win32gui.IsWindow(self.hwnd)
+            or win32gui.GetForegroundWindow() != self.hwnd
+        ):
             return
         for name in names:
             win32api.keybd_event(VK[name.upper()], 0, win32con.KEYEVENTF_KEYUP, 0)
@@ -188,6 +282,7 @@ class LogTail:
         self.path = Path(path)
         self.position = 0
         self.latest_scene: Optional[int] = None
+        self.scene_revision = 0
         self.boss_seen = False
         self.boss_dead = False
 
@@ -210,6 +305,10 @@ class LogTail:
             self.position = f.tell()
         lines = text.splitlines()
         for line in lines:
+            scene_match = SCENE_RE.search(line)
+            if scene_match:
+                self.latest_scene = int(scene_match.group(1))
+                self.scene_revision += 1
             match = COMBAT_RE.search(line)
             if not match:
                 continue
@@ -223,6 +322,27 @@ class LogTail:
                 if hp == 0 or life == "LifeDead":
                     self.boss_dead = True
         return lines
+
+
+def resolve_log_path(configured_path: str, window: GameWindow) -> Path:
+    """Resolve Player.log, using the running game's directory for portable installs."""
+    if str(configured_path).strip().lower() != "auto":
+        return Path(configured_path).resolve()
+
+    executable = window.executable_path()
+    candidates = (
+        executable.parent / "Logs" / "Player.log",
+        executable.parent / "Player.log",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            logging.info("已根据游戏进程自动找到日志：%s", candidate)
+            return candidate
+    checked = "、".join(str(path) for path in candidates)
+    raise FileNotFoundError(
+        f"已找到游戏 {executable}，但没有找到 Player.log（检查过：{checked}）。"
+        "可在 config.json 的 log_path 中填写实际路径。"
+    )
 
 
 class FatigueOCR:
@@ -271,7 +391,8 @@ class FatigueOCR:
         match = FATIGUE_RE.search(joined)
         if not match:
             return None
-        value = int(match.group(1))
+        magnitude = int(match.group(1))
+        value = -magnitude if match.group(2) == "-" else magnitude
         return value if -1000 <= value <= 1000 else None
 
     def _recognize(self, image: np.ndarray, scale: float = 2.5) -> list[str]:
@@ -346,9 +467,23 @@ class Bot:
         self.cfg = cfg
         self.live = live
         self.mode = mode
-        self.window = GameWindow(cfg["window_title"])
+        recovery_cfg = cfg.get("recovery", {})
+        self.window = GameWindow(
+            cfg["window_title"],
+            reconnect_attempts=max(
+                1, int(recovery_cfg.get("window_reconnect_attempts", 5))
+            ),
+            reconnect_interval_seconds=float(
+                recovery_cfg.get("window_reconnect_interval_seconds", 2.0)
+            ),
+            capture_retries=max(1, int(recovery_cfg.get("capture_retries", 5))),
+            capture_retry_seconds=float(
+                recovery_cfg.get("capture_retry_seconds", 0.5)
+            ),
+        )
         self.window.locate()
-        self.log_tail = LogTail(cfg["log_path"])
+        resolved_log_path = resolve_log_path(cfg.get("log_path", "auto"), self.window)
+        self.log_tail = LogTail(str(resolved_log_path))
         self.log_tail.start_at_end()
         # OCR 模型占用明显高于其余模块；延迟到完整闭环真正读取疲劳时再加载。
         self.ocr: Optional[FatigueOCR] = None
@@ -364,6 +499,7 @@ class Bot:
         self._next_revive_probe = 0.0
         self._f8_down = False
         self._f12_down = False
+        self._window_reconnect_epoch = self.window.reconnect_epoch
 
     @staticmethod
     def _load_gray_template(name: str) -> Optional[np.ndarray]:
@@ -392,6 +528,45 @@ class Bot:
             winsound.Beep(900 if self.running else 600, 180)
         self._f8_down = f8_down
 
+    def _confirm_reconnected_window(self) -> None:
+        if self.window.reconnect_epoch == self._window_reconnect_epoch:
+            return
+        self._window_reconnect_epoch = self.window.reconnect_epoch
+        self.window.release_keys(("A", "SPACE"), live=self.live)
+        recovery_cfg = self.cfg.get("recovery", {})
+        confirm_seconds = max(
+            0.0, float(recovery_cfg.get("scene_confirm_seconds", 3.0))
+        )
+        initial_revision = self.log_tail.scene_revision
+        deadline = time.monotonic() + confirm_seconds
+        while time.monotonic() < deadline and not self.stopped:
+            self.log_tail.poll()
+            if self.log_tail.scene_revision > initial_revision:
+                break
+            self.check_control_keys()
+            time.sleep(0.2)
+
+        scene = self.log_tail.latest_scene
+        normal_scene = int(self.cfg.get("scenes", {}).get("normal_scene_id", 1002))
+        if scene is None:
+            logging.warning(
+                "游戏窗口已恢复，但日志暂时没有场景记录；保持阶段 %s 并在后续流程中继续验证。",
+                self.phase,
+            )
+            return
+        scene_kind = "普通场景" if scene == normal_scene else "副本场景"
+        logging.warning(
+            "游戏窗口已恢复，日志确认最近场景为 %s（ID %s），当前阶段 %s。",
+            scene_kind,
+            scene,
+            self.phase,
+        )
+
+    def capture_frame(self) -> np.ndarray:
+        frame = self.window.capture()
+        self._confirm_reconnected_window()
+        return frame
+
     def wait(self, seconds: float) -> bool:
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
@@ -418,6 +593,8 @@ class Bot:
         point = self.cfg["coordinates"].get(name)
         if point is None:
             raise RuntimeError(f"坐标 {name} 尚未校准，请先运行 --calibrate。")
+        self.window.ensure()
+        self._confirm_reconnected_window()
         logging.info("点击 %s -> %s", name, point)
         self.window.click_normalized(point, live=self.live)
 
@@ -432,6 +609,8 @@ class Bot:
     def tap_combat_key(self, name: str, hold_seconds: float = 0.05) -> None:
         if self.phase not in ("normal_combat", "boss_combat"):
             raise RuntimeError(f"输入隔离阻止了在 {self.phase} 阶段发送战斗按键 {name}。")
+        self.window.ensure()
+        self._confirm_reconnected_window()
         self.window.tap_key(name, hold_seconds=hold_seconds, live=self.live)
 
     def revive_panel_visible(
@@ -440,7 +619,7 @@ class Bot:
         if self.revive_template is None:
             return False, 0.0
         if frame is None:
-            frame = self.window.capture()
+            frame = self.capture_frame()
         _, score = self.template_match(frame, self.revive_template)
         threshold = float(self.cfg.get("revive", {}).get("panel_match_threshold", 0.78))
         return score >= threshold, score
@@ -478,7 +657,7 @@ class Bot:
         self._next_revive_probe = now + float(
             revive_cfg.get("check_interval_seconds", 0.5)
         )
-        frame = self.window.capture()
+        frame = self.capture_frame()
         visible, score = self.revive_panel_visible(frame)
         if not visible:
             return False
@@ -487,71 +666,112 @@ class Bot:
         self.set_phase("reviving")
         logging.warning("检测到死亡复活面板（匹配分数 %.3f），已冻结所有操作。", score)
         point = revive_cfg.get("revive_button_point", [0.4375, 0.5833])
-        deadline = time.monotonic() + float(revive_cfg.get("max_wait_seconds", 45.0))
-        last_status_log = 0.0
-        clicks = 0
+        ready_region = revive_cfg.get(
+            "ready_button_region", [0.396, 0.551, 0.479, 0.588]
+        )
+        relocated_point = [
+            (ready_region[0] + ready_region[2]) / 2,
+            (ready_region[1] + ready_region[3]) / 2,
+        ]
+        wait_rounds = max(1, int(revive_cfg.get("wait_rounds", 2)))
         max_clicks = max(1, int(revive_cfg.get("max_click_attempts", 3)))
-        foreground_warned = False
+        max_wait_seconds = float(revive_cfg.get("max_wait_seconds", 45.0))
 
-        while time.monotonic() < deadline and not self.stopped:
-            self.check_control_keys()
-            if not self.running:
-                pause_started = time.monotonic()
-                while not self.running and not self.stopped:
-                    self.check_control_keys()
-                    time.sleep(0.05)
-                deadline += time.monotonic() - pause_started
-                continue
-            if not self.window.is_foreground():
-                if not foreground_warned:
-                    logging.warning("死亡等待中游戏失去前台；切回游戏后才会点击原地复活。")
-                    foreground_warned = True
-                foreground_lost_at = time.monotonic()
-                while not self.window.is_foreground() and not self.stopped:
-                    self.check_control_keys()
-                    time.sleep(0.2)
-                deadline += time.monotonic() - foreground_lost_at
-                continue
+        for wait_round in range(1, wait_rounds + 1):
+            deadline = time.monotonic() + max_wait_seconds
+            last_status_log = 0.0
+            clicks = 0
             foreground_warned = False
-            # 鼠标保持在按钮上：按钮可用时会稳定显示为橙色。
-            self.window.move_client(
-                *self.window.normalized_to_client(point), live=self.live
-            )
-            frame = self.window.capture()
-            visible, panel_score = self.revive_panel_visible(frame)
-            if not visible:
-                logging.info("复活面板已消失，确认人物已恢复操作。")
-                self.revive_epoch += 1
-                self.set_phase(
-                    previous_phase,
-                    combat=previous_phase in ("normal_combat", "boss_combat"),
+            if wait_round > 1:
+                point = relocated_point
+                logging.warning(
+                    "第一轮复活等待未成功，已根据按钮检测区域重新定位，开始第 %s/%s 轮。",
+                    wait_round,
+                    wait_rounds,
                 )
-                time.sleep(float(revive_cfg.get("post_revive_seconds", 1.0)))
-                return True
-            ready, orange_ratio = self.revive_ready(frame)
-            if ready and clicks < max_clicks:
-                clicks += 1
-                logging.info(
-                    "原地复活按钮已可用（橙色占比 %.3f），点击第 %s/%s 次。",
-                    orange_ratio,
-                    clicks,
-                    max_clicks,
-                )
-                self.window.click_normalized(point, live=self.live)
-                time.sleep(0.8)
-                continue
-            if time.monotonic() - last_status_log >= 3.0:
-                logging.info(
-                    "等待原地复活解除倒计时：面板 %.3f，按钮橙色占比 %.3f。",
-                    panel_score,
-                    orange_ratio,
-                )
-                last_status_log = time.monotonic()
-            time.sleep(0.2)
 
-        if self.stopped:
-            return True
-        raise RuntimeError("检测到死亡，但等待原地复活超时；已安全暂停。")
+            while time.monotonic() < deadline and not self.stopped:
+                self.check_control_keys()
+                if not self.running:
+                    pause_started = time.monotonic()
+                    while not self.running and not self.stopped:
+                        self.check_control_keys()
+                        time.sleep(0.05)
+                    deadline += time.monotonic() - pause_started
+                    continue
+                if not self.window.is_foreground():
+                    if not foreground_warned:
+                        logging.warning("死亡等待中游戏失去前台；切回游戏后才会点击原地复活。")
+                        foreground_warned = True
+                    foreground_lost_at = time.monotonic()
+                    while not self.window.is_foreground() and not self.stopped:
+                        self.check_control_keys()
+                        time.sleep(0.2)
+                    deadline += time.monotonic() - foreground_lost_at
+                    continue
+                foreground_warned = False
+                # 鼠标保持在按钮上：按钮可用时会稳定显示为橙色。
+                self.window.move_client(
+                    *self.window.normalized_to_client(point), live=self.live
+                )
+                frame = self.capture_frame()
+                visible, panel_score = self.revive_panel_visible(frame)
+                if not visible:
+                    logging.info("复活面板已消失，确认人物已恢复操作。")
+                    self.revive_epoch += 1
+                    self.set_phase(
+                        previous_phase,
+                        combat=previous_phase in ("normal_combat", "boss_combat"),
+                    )
+                    time.sleep(float(revive_cfg.get("post_revive_seconds", 1.0)))
+                    return True
+                ready, orange_ratio = self.revive_ready(frame)
+                if ready and clicks < max_clicks:
+                    clicks += 1
+                    logging.info(
+                        "原地复活按钮已可用（橙色占比 %.3f），点击第 %s/%s 次。",
+                        orange_ratio,
+                        clicks,
+                        max_clicks,
+                    )
+                    self.window.click_normalized(point, live=self.live)
+                    time.sleep(0.8)
+                    continue
+                if time.monotonic() - last_status_log >= 3.0:
+                    logging.info(
+                        "等待原地复活解除倒计时：面板 %.3f，按钮橙色占比 %.3f。",
+                        panel_score,
+                        orange_ratio,
+                    )
+                    last_status_log = time.monotonic()
+                time.sleep(0.2)
+
+            if self.stopped:
+                return True
+            if wait_round < wait_rounds:
+                self.window.release_keys(("A", "SPACE"), live=self.live)
+                retry_point = revive_cfg.get("retry_move_point", [0.5, 0.5])
+                if self.window.is_foreground():
+                    self.window.move_client(
+                        *self.window.normalized_to_client(retry_point), live=self.live
+                    )
+                time.sleep(float(revive_cfg.get("retry_settle_seconds", 1.0)))
+                retry_frame = self.capture_frame()
+                still_visible, _ = self.revive_panel_visible(retry_frame)
+                if not still_visible:
+                    logging.info("重新截图后复活面板已消失，确认人物已恢复操作。")
+                    self.revive_epoch += 1
+                    self.set_phase(
+                        previous_phase,
+                        combat=previous_phase in ("normal_combat", "boss_combat"),
+                    )
+                    time.sleep(float(revive_cfg.get("post_revive_seconds", 1.0)))
+                    return True
+                continue
+
+        raise RuntimeError(
+            f"检测到死亡，但连续 {wait_rounds} 轮等待和重新定位后仍无法原地复活；已安全暂停。"
+        )
 
     def template_match(
         self, frame: np.ndarray, template: Optional[np.ndarray]
@@ -575,12 +795,12 @@ class Bot:
         return center, float(score)
 
     def panel_visible(self) -> bool:
-        _, score = self.template_match(self.window.capture(), self.panel_template)
+        _, score = self.template_match(self.capture_frame(), self.panel_template)
         logging.debug("副本面板匹配分数 %.3f", score)
         return score >= self.cfg["entrance"]["panel_match_threshold"]
 
     def map_visible(self) -> bool:
-        _, score = self.template_match(self.window.capture(), self.map_template)
+        _, score = self.template_match(self.capture_frame(), self.map_template)
         logging.info("地图打开状态匹配分数 %.3f", score)
         return score >= self.cfg["map_detection"]["open_match_threshold"]
 
@@ -588,23 +808,55 @@ class Bot:
         if self.map_visible():
             logging.info("地图已经打开，无需重复点击小地图。")
             return
-        retries = max(1, int(self.cfg["map_detection"].get("open_retries", 3)))
-        for attempt in range(1, retries + 1):
-            logging.info("点击右上角小地图并验证地图界面，第 %s/%s 次。", attempt, retries)
+        map_cfg = self.cfg["map_detection"]
+        legacy_retries = max(1, int(map_cfg.get("open_retries", 3)))
+        recovery_rounds = max(
+            0, int(map_cfg.get("recovery_rounds", legacy_retries - 1))
+        )
+        total_attempts = 1 + recovery_rounds
+        settle_seconds = max(
+            0.0, float(map_cfg.get("recovery_settle_seconds", 0.8))
+        )
+        for attempt in range(1, total_attempts + 1):
+            if attempt > 1:
+                logging.warning(
+                    "地图未能打开，开始恢复轮次 %s/%s：释放按键并尝试关闭遮挡面板。",
+                    attempt - 1,
+                    recovery_rounds,
+                )
+                self.window.release_keys(("A", "SPACE"), live=self.live)
+                if not self.wait(settle_seconds):
+                    return
+                self.window.ensure()
+                self._confirm_reconnected_window()
+                self.window.tap_key("ESC", live=self.live)
+                if not self.wait(settle_seconds):
+                    return
+                if self.map_visible():
+                    logging.info("关闭遮挡面板后检测到地图已经打开。")
+                    return
+            logging.info(
+                "点击右上角小地图并验证地图界面，第 %s/%s 次。",
+                attempt,
+                total_attempts,
+            )
             self.click("map_button")
             if not self.wait(self.cfg["timing"]["map_open_seconds"]):
                 return
             if self.map_visible():
                 logging.info("已确认地图界面打开。")
                 return
-        raise RuntimeError("点击小地图后仍未检测到地图界面；请运行“重新校准小地图.bat”。")
+        raise RuntimeError(
+            f"初次尝试及 {recovery_rounds} 轮恢复后仍未检测到地图界面；"
+            "请运行“重新校准小地图.bat”。"
+        )
 
     def find_portal(self) -> tuple[int, int]:
         deadline = time.monotonic() + 25.0
         best_score = 0.0
         best_center: Optional[tuple[int, int]] = None
         while time.monotonic() < deadline and not self.stopped:
-            frame = self.window.capture()
+            frame = self.capture_frame()
             center, score = self.template_match(frame, self.portal_template)
             if score > best_score:
                 best_score, best_center = score, center
@@ -637,34 +889,68 @@ class Bot:
                     return
         raise RuntimeError("绕入口移动后仍未检测到副本面板。")
 
-    def read_fatigue(self, attempts: int = 3) -> Optional[int]:
+    def read_fatigue(
+        self, attempts: int = 3, refresh_rounds: int = 1
+    ) -> Optional[int]:
         if self.ocr is None:
             self.ocr = FatigueOCR(self.cfg.get("debug"))
-        hover = self.window.normalized_to_client(self.cfg["fatigue"]["hover_point"])
-        revive_epoch = self.revive_epoch
-        self.window.move_client(*hover, live=self.live)
-        self.wait(0.8)
-        if self.revive_epoch != revive_epoch:
-            return self.read_fatigue(attempts=attempts)
-        values: list[int] = []
-        for _ in range(attempts):
-            frame = self.window.capture()
-            value, texts = self.ocr.read(
-                frame,
-                self.cfg["fatigue"]["ocr_region"],
-                self.cfg["fatigue"].get("value_region"),
+        fatigue_cfg = self.cfg["fatigue"]
+        refresh_rounds = max(1, int(refresh_rounds))
+        for refresh_round in range(1, refresh_rounds + 1):
+            hover = self.window.normalized_to_client(fatigue_cfg["hover_point"])
+            refresh = self.window.normalized_to_client(
+                fatigue_cfg.get("refresh_point", [0.5, 0.5])
             )
-            logging.info("疲劳 OCR: value=%s raw=%s", value, texts)
-            if value is not None and -1000 <= value <= 1000:
-                values.append(value)
-            self.wait(0.25)
-        if not values:
-            return None
-        values.sort()
-        value = values[len(values) // 2]
-        self.last_fatigue = value
-        logging.info("确认当前疲劳值：%s/1000", value)
-        return value
+            self._confirm_reconnected_window()
+            revive_epoch = self.revive_epoch
+
+            # 每一轮都先移出再移回，强制游戏丢弃旧提示框并生成最新数值。
+            self.window.move_client(*refresh, live=self.live)
+            if not self.wait(float(fatigue_cfg.get("refresh_leave_seconds", 0.25))):
+                return None
+            if self.revive_epoch != revive_epoch:
+                return self.read_fatigue(
+                    attempts=attempts, refresh_rounds=refresh_rounds
+                )
+            self.window.move_client(*hover, live=self.live)
+            if not self.wait(float(fatigue_cfg.get("hover_settle_seconds", 0.8))):
+                return None
+            if self.revive_epoch != revive_epoch:
+                return self.read_fatigue(
+                    attempts=attempts, refresh_rounds=refresh_rounds
+                )
+
+            values: list[int] = []
+            for _ in range(attempts):
+                frame = self.capture_frame()
+                value, texts = self.ocr.read(
+                    frame,
+                    fatigue_cfg["ocr_region"],
+                    fatigue_cfg.get("value_region"),
+                )
+                logging.info("疲劳 OCR: value=%s raw=%s", value, texts)
+                if value is not None and -1000 <= value <= 1000:
+                    values.append(value)
+                if not self.wait(0.25):
+                    return None
+            if values:
+                values.sort()
+                value = values[len(values) // 2]
+                self.last_fatigue = value
+                logging.info("确认当前疲劳值：%s/1000", value)
+                return value
+            if refresh_round < refresh_rounds:
+                logging.warning(
+                    "疲劳 OCR 第 %s/%s 轮未识别成功，将重新移出并移回状态栏。",
+                    refresh_round,
+                    refresh_rounds,
+                )
+                if not self.wait(
+                    float(fatigue_cfg.get("ocr_retry_interval_seconds", 0.5))
+                ):
+                    return None
+        logging.warning("疲劳 OCR 连续 %s 轮均未识别成功。", refresh_rounds)
+        return None
 
     def normal_farm_until_low(self) -> None:
         logging.info("状态：普通区域挂机。")
@@ -736,7 +1022,7 @@ class Bot:
                 return
             logging.info("副本寻路期间发生过复活，重新下发 BOSS 寻路。")
 
-    def fight_boss(self) -> None:
+    def fight_boss(self) -> bool:
         logging.info("状态：寻找并攻击 BOSS。")
         self.set_phase("boss_combat", combat=True)
         self.log_tail.boss_seen = False
@@ -754,12 +1040,17 @@ class Bot:
                 logging.info("日志已识别 BOSS 实体 %s。", self.cfg["combat"]["boss_entity_id"])
             if self.log_tail.boss_dead:
                 logging.info("日志确认 BOSS 已死亡。")
-                return
+                return True
             self.wait(self.cfg["combat"]["attack_interval_seconds"])
             if self.revive_epoch != revive_epoch:
                 deadline = time.monotonic() + self.cfg["timing"]["boss_timeout_seconds"]
                 revive_epoch = self.revive_epoch
-        raise RuntimeError("BOSS 战超时，未从日志检测到 BOSS 死亡。")
+        if self.stopped:
+            return False
+        logging.warning(
+            "BOSS 战超时，未从日志检测到 BOSS 死亡；将退出本次副本并继续恢复流程。"
+        )
+        return False
 
     def pickup_and_exit(self) -> None:
         logging.info("状态：拾取 BOSS 掉落。")
@@ -770,6 +1061,9 @@ class Bot:
             live=self.live,
         )
         self.wait(1.5)
+        self.exit_dungeon()
+
+    def exit_dungeon(self) -> None:
         logging.info("状态：退出副本。")
         self.set_phase("exiting_dungeon")
         self.click("exit_dungeon_button")
@@ -785,15 +1079,40 @@ class Bot:
             self.travel_to_first_entrance()
             self.enter_dungeon()
             self.travel_to_boss()
-            self.fight_boss()
-            self.pickup_and_exit()
-            completed_runs += 1
-            logging.info("本轮疲劳恢复已完成 %s 次副本（至少 %s 次）。", completed_runs, minimum_runs)
-            if completed_runs < minimum_runs:
-                continue
-            fatigue = self.read_fatigue()
+            boss_defeated = self.fight_boss()
+            if self.stopped:
+                return
+            if boss_defeated:
+                self.pickup_and_exit()
+                completed_runs += 1
+                logging.info(
+                    "本轮疲劳恢复已完成 %s 次副本（至少 %s 次）。",
+                    completed_runs,
+                    minimum_runs,
+                )
+                if completed_runs < minimum_runs:
+                    continue
+            else:
+                # 超时可能是未击杀，也可能只是日志漏报。无论哪种情况都先安全
+                # 退出副本，再以实际疲劳值决定返回挂机还是继续下一轮。
+                self.exit_dungeon()
+                if self.stopped:
+                    return
+                logging.info("BOSS 战超时后已退出副本，立即重新检查疲劳值。")
+            extra_ocr_rounds = max(
+                0,
+                int(
+                    self.cfg["fatigue"].get(
+                        "post_dungeon_extra_ocr_rounds", 2
+                    )
+                ),
+            )
+            fatigue = self.read_fatigue(refresh_rounds=1 + extra_ocr_rounds)
             if fatigue is None:
-                raise RuntimeError("退出副本后无法识别疲劳值，已安全暂停。")
+                logging.warning(
+                    "退出副本后追加 OCR 仍未识别疲劳值；不中断挂机，继续下一次副本。"
+                )
+                continue
             if fatigue >= self.cfg["fatigue"]["boss_target"]:
                 logging.info("疲劳已恢复到 %s，结束 BOSS 循环。", fatigue)
                 return
@@ -806,10 +1125,16 @@ class Bot:
             self.travel_to_first_entrance()
             self.enter_dungeon()
             self.travel_to_boss()
-            self.fight_boss()
-            self.pickup_and_exit()
-            completed_runs += 1
-            logging.info("只刷副本模式已完成 %s 次。", completed_runs)
+            boss_defeated = self.fight_boss()
+            if self.stopped:
+                return
+            if boss_defeated:
+                self.pickup_and_exit()
+                completed_runs += 1
+                logging.info("只刷副本模式已完成 %s 次。", completed_runs)
+            else:
+                self.exit_dungeon()
+                logging.warning("只刷副本模式本次 BOSS 超时，已退出并准备下一轮。")
 
     def run(self) -> None:
         required = [
@@ -969,8 +1294,14 @@ def main() -> int:
         raise RuntimeError("已有一个挂机脚本正在运行，请先按 F12 关闭旧实例。")
     mode = args.mode
     if mode is None:
+        minimum_runs = max(
+            1, int(cfg.get("boss_loop", {}).get("minimum_runs", 8))
+        )
         print("请选择运行模式：")
-        print("  1. 完整闭环（普通挂机 -> 疲劳低于阈值 -> 至少 8 次副本 -> 返回挂机）")
+        print(
+            f"  1. 完整闭环（普通挂机 -> 疲劳低于阈值 -> "
+            f"至少 {minimum_runs} 次副本 -> 返回挂机）"
+        )
         print("  2. 只刷副本（持续重复进入、击杀、拾取、退出）")
         choice = input("输入 1 或 2，直接回车默认 1：").strip()
         mode = "dungeon" if choice == "2" else "full"

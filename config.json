@@ -1,91 +1,209 @@
 {
+  "_comment": "挂机脚本参数。所有坐标和区域均以游戏客户区（不含标题栏和边框）为基准；坐标格式为 [横向比例, 纵向比例]，区域格式为 [左, 上, 右, 下]，比例范围通常为 0～1。以 _comment 或 _xxx_comment 命名的字段仅用于说明，程序会忽略。",
   "window_title": "CreatureCurios",
+  "_window_title_comment": "目标游戏窗口的完整标题，必须与窗口标题完全一致；脚本只允许同时找到一个同名窗口。",
   "reference_client_size": [
     1280,
     720
   ],
+  "_reference_client_size_comment": "录制模板和入口绕圈半径时使用的客户区基准尺寸，格式为 [宽, 高]，单位为像素。普通坐标已归一化，通常不需要随分辨率修改此项。",
   "fatigue": {
+    "_comment": "疲劳值检测与模式切换参数。游戏疲劳显示范围按 -1000～1000 处理。",
     "low_threshold": -800,
+    "_low_threshold_comment": "普通挂机时，OCR 读数小于或等于此值便停止普通挂机并进入 BOSS 副本恢复循环。",
     "boss_target": 800,
-    "check_interval_seconds": 300,
+    "_boss_target_comment": "完成最低副本次数后开始检查疲劳；读数大于或等于此值时退出 BOSS 循环并恢复普通挂机。",
+    "check_interval_seconds": 400,
+    "_check_interval_seconds_comment": "普通挂机期间两次疲劳检查的间隔，单位为秒。调得过小会频繁移动鼠标并执行 OCR。",
     "hover_point": [
-      0.944531,
-      0.965278
+      0.946094,
+      0.969444
     ],
+    "_hover_point_comment": "触发疲劳提示框所需的鼠标悬停点，格式为 [x, y] 的客户区归一化坐标；可通过校准流程重新记录。",
+    "refresh_point": [
+      0.5,
+      0.5
+    ],
+    "_refresh_point_comment": "每次检查疲劳前，鼠标会先移到此处使旧提示框失效，再移回 hover_point，从而强制游戏显示最新状态。建议选择画面中央且不会触发其他悬停面板的位置。",
+    "refresh_leave_seconds": 0.25,
+    "_refresh_leave_seconds_comment": "鼠标移出状态栏后等待旧提示框消失的时间，单位为秒；若提示框未及时关闭，可适当增大。",
+    "hover_settle_seconds": 0.8,
+    "_hover_settle_seconds_comment": "鼠标重新移回状态栏后，等待最新疲劳提示框完全显示的时间，单位为秒。",
+    "post_dungeon_extra_ocr_rounds": 2,
+    "_post_dungeon_extra_ocr_rounds_comment": "退出副本后，首次 OCR 完全失败时追加的刷新识别轮数。每轮都会重新把鼠标移出并移回状态栏；全部失败后记录警告并继续下一次副本，不中断挂机。",
+    "ocr_retry_interval_seconds": 0.5,
+    "_ocr_retry_interval_seconds_comment": "追加 OCR 轮次之间的等待时间，单位为秒。",
     "ocr_region": [
       0.74,
       0.68,
       0.998,
       0.94
-    ]
+    ],
+    "_ocr_region_comment": "疲劳提示框的 OCR 截图范围，格式为 [左, 上, 右, 下] 的客户区归一化坐标。范围过大会引入无关文字，过小可能裁掉数值。"
   },
   "coordinates": {
+    "_comment": "自动点击使用的客户区归一化坐标，均为 [x, y]。除 map_button 可单独重录外，其余点位可通过‘校准坐标.bat’重新记录。",
     "map_button": [
-      0.917969,
-      0.161111
+      0.913281,
+      0.152778
     ],
+    "_map_button_comment": "右上角圆形小地图的中心，用于展开地图。",
     "normal_portal_marker": [
-      0.400781,
-      0.279167
+      0.399219,
+      0.276389
     ],
+    "_normal_portal_marker_comment": "普通区域大地图上的冰牙海湾入口标记，点击后角色会自动寻路。",
     "enter_dungeon_button": [
-      0.503906,
-      0.7125
+      0.5,
+      0.718056
     ],
+    "_enter_dungeon_button_comment": "副本入口面板中的‘进入副本’按钮中心。",
     "dungeon_boss_marker": [
-      0.563281,
-      0.379167
+      0.52,
+      0.302222
     ],
+    "_dungeon_boss_marker_comment": "副本大地图上的 BOSS 目标点，点击后角色会自动寻路。",
     "exit_dungeon_button": [
-      0.822656,
-      0.165278
+      0.83125,
+      0.166667
     ],
+    "_exit_dungeon_button_comment": "击杀 BOSS 并拾取后使用的副本退出按钮中心。",
     "confirm_exit_button": [
-      0.483594,
-      0.538889
-    ]
+      0.472656,
+      0.540278
+    ],
+    "_confirm_exit_button_comment": "退出副本确认弹窗中的确认按钮中心。"
   },
   "combat": {
+    "_comment": "普通挂机和 BOSS 战的按键、频率以及日志识别参数。按键名称必须是程序 VK 表中支持的名称。",
     "attack_key": "A",
+    "_attack_key_comment": "攻击键；当前程序支持 A、SPACE、ESC、F2、F8、F12，通常保持 A。",
     "attack_interval_seconds": 0.45,
+    "_attack_interval_seconds_comment": "连续攻击按键之间的间隔，单位为秒。数值越小，按键越频繁。",
     "pickup_key": "SPACE",
+    "_pickup_key_comment": "拾取键，普通挂机时按固定间隔点按，BOSS 死亡后会持续按住一段时间。",
     "pickup_interval_seconds": 1.5,
+    "_pickup_interval_seconds_comment": "普通挂机时两次拾取按键之间的间隔，单位为秒。",
     "boss_pickup_hold_seconds": 1.0,
+    "_boss_pickup_hold_seconds_comment": "BOSS 死亡后持续按住拾取键的时间，单位为秒。",
     "boss_entity_id": 100043,
-    "boss_max_hp": 18000
+    "_boss_entity_id_comment": "从 Player.log 中识别目标 BOSS 时使用的实体 ID；更换副本或 BOSS 时需要同步修改。",
+    "boss_max_hp": 18000,
+    "_boss_max_hp_comment": "目标 BOSS 的初始/最大生命值，保留用于诊断和后续强化日志校验；当前死亡判断以 boss_entity_id、HP=0 或 LifeDead 为准。"
   },
   "scenes": {
+    "_comment": "用于解析 Player.log 和区分地图状态的场景参数。",
     "normal_scene_id": 1002,
-    "boss_scene_id_is_dynamic": true
+    "_normal_scene_id_comment": "普通挂机区域的场景 ID。",
+    "boss_scene_id_is_dynamic": true,
+    "_boss_scene_id_is_dynamic_comment": "true 表示副本实例的场景 ID 每次进入都可能变化，因此不使用固定 ID 判断；当前脚本按此模式设计。"
   },
   "timing": {
-    "map_open_seconds": 1.0,
-    "normal_auto_path_seconds": 12.0,
-    "dungeon_load_seconds": 8.0,
-    "boss_auto_path_seconds": 16.0,
-    "boss_timeout_seconds": 150.0,
-    "exit_load_seconds": 9.0,
+    "_comment": "界面、寻路、加载和战斗各阶段的等待时间，单位均为秒。网络或电脑较慢时可适当增大，过短容易在界面尚未就绪时误操作。",
+    "map_open_seconds": 0.2,
+    "_map_open_seconds_comment": "点击小地图后，等待地图展开再进行模板确认的时间。",
+    "normal_auto_path_seconds": 10.0,
+    "_normal_auto_path_seconds_comment": "在普通区域点击副本入口标记后，预留给自动寻路的时间。",
+    "dungeon_load_seconds": 5.0,
+    "_dungeon_load_seconds_comment": "点击进入副本后等待场景加载完成的时间。",
+    "boss_auto_path_seconds": 18.0,
+    "_boss_auto_path_seconds_comment": "在副本地图点击 BOSS 点后，预留给自动寻路的时间。",
+    "boss_timeout_seconds": 180.0,
+    "_boss_timeout_seconds_comment": "单场 BOSS 战允许的最长时间。复活后会重新计时；超时且日志仍未确认 BOSS 死亡时，脚本会退出本次副本，重新检查疲劳后继续流程，不会暂停整个挂机任务。",
+    "exit_load_seconds": 5.0,
+    "_exit_load_seconds_comment": "确认退出副本后等待返回普通区域并完成加载的时间。",
     "panel_wait_seconds": 0.5,
+    "_panel_wait_seconds_comment": "通用面板操作的预留等待时间；当前版本保留此参数，部分流程可能未直接使用。",
     "circle_click_interval_seconds": 0.35,
-    "combat_input_quiet_seconds": 1.0
+    "_circle_click_interval_seconds_comment": "围绕副本入口逐点移动时，相邻两次点击的间隔。过小可能使寻路指令来不及生效。",
+    "combat_input_quiet_seconds": 0.2,
+    "_combat_input_quiet_seconds_comment": "从战斗切换到地图或寻路操作前，释放攻击/拾取键后的静默等待时间。"
   },
   "boss_loop": {
-    "minimum_runs": 8
+    "_comment": "BOSS 疲劳恢复循环的控制参数。",
+    "minimum_runs": 10,
+    "_minimum_runs_comment": "每轮进入 BOSS 恢复模式后至少完成的副本次数；达到此次数后才重新 OCR 检查疲劳，避免每次退出都检测。"
   },
   "debug": {
+    "_comment": "诊断截图与日志辅助参数。",
     "ocr_failure_min_interval_seconds": 60,
-    "max_ocr_failure_images": 20
+    "_ocr_failure_min_interval_seconds_comment": "OCR 识别失败截图的最短保存间隔，单位为秒，用于防止短时间生成大量图片。",
+    "max_ocr_failure_images": 20,
+    "_max_ocr_failure_images_comment": "debug 目录最多保留的 OCR 失败截图数量；超过后会优先清理较旧的截图。"
   },
   "entrance": {
+    "_comment": "副本入口模板识别以及绕入口移动的参数。",
     "circle_radius_pixels_at_1280x720": 62,
+    "_circle_radius_pixels_at_1280x720_comment": "在 1280×720 客户区下，围绕识别到的入口中心移动时采用的圆半径，单位为像素；其他宽度会按比例缩放。",
     "circle_points": 12,
+    "_circle_points_comment": "每一圈均匀点击的点数。点数越多，覆盖越细，但完成一圈所需时间越长。",
     "max_circle_rounds": 3,
+    "_max_circle_rounds_comment": "最多尝试绕入口移动的圈数；每圈过程中都会持续检查副本入口面板是否出现。",
     "portal_match_threshold": 0.5,
-    "panel_match_threshold": 0.62
+    "_portal_match_threshold_comment": "入口圆圈模板匹配阈值，通常为 0～1，越高越严格。识别不到可小幅降低，但不建议低于 0.42，以免误识别。",
+    "panel_match_threshold": 0.62,
+    "_panel_match_threshold_comment": "副本入口面板模板匹配阈值，通常为 0～1；越高越不容易误判，但过高可能漏检。"
   },
   "map_detection": {
+    "_comment": "大地图是否成功展开的模板检测参数。",
     "open_match_threshold": 0.52,
-    "open_retries": 3
+    "_open_match_threshold_comment": "地图界面模板匹配阈值，通常为 0～1；越高越严格。",
+    "open_retries": 3,
+    "_open_retries_comment": "兼容旧配置的地图尝试次数；未填写 recovery_rounds 时，会用此值减一作为恢复轮数。",
+    "recovery_rounds": 2,
+    "_recovery_rounds_comment": "初次点击小地图失败后执行的恢复轮数。每轮会释放战斗按键、等待界面稳定、按 ESC 尝试关闭遮挡面板，再重新点击小地图。",
+    "recovery_settle_seconds": 0.8,
+    "_recovery_settle_seconds_comment": "地图恢复轮次中，释放按键以及关闭遮挡面板后的稳定等待时间，单位为秒。"
   },
-  "log_path": "../Logs/Player.log"
+  "recovery": {
+    "_comment": "窗口和截图层面的通用恢复参数。达到次数上限后才会让自动流程安全暂停。",
+    "capture_retries": 5,
+    "_capture_retries_comment": "单次截图失败时最多连续尝试的总次数，包括第一次截图。每次失败后都会重新枚举游戏窗口。",
+    "capture_retry_seconds": 0.5,
+    "_capture_retry_seconds_comment": "截图失败后再次尝试前的等待时间，单位为秒。",
+    "window_reconnect_attempts": 5,
+    "_window_reconnect_attempts_comment": "游戏窗口句柄失效后，重新查找同名窗口的最大次数。",
+    "window_reconnect_interval_seconds": 2.0,
+    "_window_reconnect_interval_seconds_comment": "相邻两次重新查找游戏窗口之间的等待时间，单位为秒。",
+    "scene_confirm_seconds": 3.0,
+    "_scene_confirm_seconds_comment": "窗口重新连接后等待 Player.log 提供新场景记录的最长时间，单位为秒；若暂时没有新记录，会保留最近已知场景并在后续流程继续验证。"
+  },
+  "revive": {
+    "_comment": "死亡面板检测、原地复活按钮识别以及第二轮恢复参数。第二轮仍失败时会暂停，避免在死亡界面盲目操作。",
+    "check_interval_seconds": 0.5,
+    "_check_interval_seconds_comment": "正常流程中检查死亡面板的最短间隔，单位为秒。",
+    "panel_match_threshold": 0.78,
+    "_panel_match_threshold_comment": "死亡复活面板的模板匹配阈值，通常为 0～1，越高越严格。",
+    "ready_button_region": [
+      0.396,
+      0.551,
+      0.479,
+      0.588
+    ],
+    "_ready_button_region_comment": "判断‘原地复活’按钮是否变为橙色的区域，格式为 [左, 上, 右, 下]；第二轮也会使用该区域中心重新定位按钮。",
+    "revive_button_point": [
+      0.4375,
+      0.5833
+    ],
+    "_revive_button_point_comment": "第一轮点击‘原地复活’按钮的客户区归一化坐标。",
+    "ready_orange_ratio": 0.45,
+    "_ready_orange_ratio_comment": "按钮区域中橙色像素占比达到此值后，认为倒计时结束且按钮可以点击。",
+    "max_wait_seconds": 45.0,
+    "_max_wait_seconds_comment": "每一轮等待原地复活成功的最长时间，单位为秒。",
+    "max_click_attempts": 3,
+    "_max_click_attempts_comment": "每轮中检测到按钮可用后，最多尝试点击的次数。",
+    "wait_rounds": 2,
+    "_wait_rounds_comment": "复活等待总轮数。第一轮失败后会重新截图，并根据 ready_button_region 中心重新定位后开始第二轮。",
+    "retry_move_point": [
+      0.5,
+      0.5
+    ],
+    "_retry_move_point_comment": "两轮复活之间临时移开鼠标的位置，用于刷新按钮悬停和界面状态。",
+    "retry_settle_seconds": 1.0,
+    "_retry_settle_seconds_comment": "两轮复活之间重新截图前的等待时间，单位为秒。",
+    "post_revive_seconds": 1.0,
+    "_post_revive_seconds_comment": "确认复活面板消失后，恢复原流程前的稳定等待时间，单位为秒。"
+  },
+  "log_path": "auto",
+  "_log_path_comment": "游戏 Player.log 的路径。推荐保持 auto：程序会根据正在运行的 CreatureCurios.exe 自动定位游戏目录下的 Logs/Player.log，因此项目克隆到任意目录都能使用。也可填写绝对路径；相对路径以项目目录为起点。"
 }
