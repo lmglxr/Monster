@@ -2083,19 +2083,57 @@ def calibrate_inventory(cfg: dict) -> None:
 
 
 def ocr_test(cfg: dict) -> None:
-    window = GameWindow(cfg["window_title"])
+    recovery_cfg = cfg.get("recovery", {})
+    window_cfg = cfg.get("window_control", {})
+    window = GameWindow(
+        cfg["window_title"],
+        reconnect_attempts=max(
+            1, int(recovery_cfg.get("window_reconnect_attempts", 5))
+        ),
+        reconnect_interval_seconds=max(
+            0.1, float(recovery_cfg.get("window_reconnect_interval_seconds", 2.0))
+        ),
+        capture_retries=max(1, int(recovery_cfg.get("capture_retries", 5))),
+        capture_retry_seconds=max(
+            0.1, float(recovery_cfg.get("capture_retry_seconds", 0.5))
+        ),
+        input_mode=str(window_cfg.get("input_mode", "foreground_only")),
+        focus_settle_seconds=max(
+            0.0, float(window_cfg.get("focus_settle_seconds", 0.08))
+        ),
+        focus_activation_attempts=max(
+            1, int(window_cfg.get("focus_activation_attempts", 3))
+        ),
+        focus_activation_retry_seconds=max(
+            0.01, float(window_cfg.get("focus_activation_retry_seconds", 0.08))
+        ),
+        post_input_seconds=max(
+            0.0, float(window_cfg.get("post_input_seconds", 0.12))
+        ),
+        restore_previous_window=bool(
+            window_cfg.get("restore_previous_window", True)
+        ),
+        capture_mode=str(window_cfg.get("capture_mode", "screen")),
+    )
     window.locate()
     reader = FatigueOCR(cfg.get("debug"))
-    hover = window.normalized_to_client(cfg["fatigue"]["hover_point"])
-    print("请保持游戏在前台。程序将把鼠标移到疲劳条并读取提示框。")
-    time.sleep(2)
-    window.move_client(*hover, live=True)
-    time.sleep(0.8)
-    value, texts = reader.read(
-        window.capture(),
-        cfg["fatigue"]["ocr_region"],
-        cfg["fatigue"].get("value_region"),
+    fatigue_cfg = cfg["fatigue"]
+    refresh = window.normalized_to_client(
+        fatigue_cfg.get("refresh_point", [0.5, 0.5])
     )
+    hover = window.normalized_to_client(fatigue_cfg["hover_point"])
+    print("程序将按正式流程把鼠标移出再移回疲劳条，并读取最新提示框。")
+    time.sleep(2)
+    with window.input_session(live=True):
+        window.move_client(*refresh, live=True)
+        time.sleep(float(fatigue_cfg.get("refresh_leave_seconds", 0.25)))
+        window.move_client(*hover, live=True)
+        time.sleep(float(fatigue_cfg.get("hover_settle_seconds", 0.8)))
+        value, texts = reader.read(
+            window.capture(),
+            fatigue_cfg["ocr_region"],
+            fatigue_cfg.get("value_region"),
+        )
     print(f"识别结果：{value}/1000；原始OCR：{texts}")
 
 
@@ -2357,6 +2395,10 @@ def main() -> int:
         default=2,
         help="完整闭环冒烟测试轮数，最小为 2",
     )
+    parser.add_argument(
+        "--config-overrides",
+        help="额外配置覆盖文件；相对路径以程序目录为基准，例如 laptop_config.json",
+    )
     parser.add_argument("--live", action="store_true", help="允许真实发送输入；否则为演练模式")
     parser.add_argument(
         "--mode",
@@ -2374,6 +2416,17 @@ def main() -> int:
         ],
     )
     cfg = load_config()
+    if args.config_overrides:
+        override_path = Path(args.config_overrides).expanduser()
+        if not override_path.is_absolute():
+            override_path = APP_DIR / override_path
+        override_path = override_path.resolve()
+        if not override_path.exists():
+            raise FileNotFoundError(f"找不到额外配置文件：{override_path}")
+        with override_path.open("r", encoding="utf-8") as f:
+            overrides = json.load(f)
+        merge_config_overrides(cfg, overrides)
+        logging.info("已加载额外配置：%s", override_path)
     if args.calibrate:
         calibrate(cfg)
         return 0

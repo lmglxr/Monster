@@ -1,0 +1,73 @@
+{
+  "_comment": "低帧率、机械硬盘或界面加载较慢的笔记本稳健参数。该文件只覆盖等待与重试配置；坐标、疲劳阈值、技能周期等仍从 config.json 读取。使用‘启动挂机MVP-笔记本.bat’时自动加载。",
+  "window_control": {
+    "_comment": "延长每次焦点切换前后的稳定时间，并增加 Windows 拒绝激活窗口时的重试次数。",
+    "focus_settle_seconds": 0.25,
+    "focus_activation_attempts": 5,
+    "focus_activation_retry_seconds": 0.2,
+    "post_input_seconds": 0.25
+  },
+  "fatigue": {
+    "_comment": "给旧提示框消失、新提示框生成以及低帧率下的 OCR 截图留出更多时间。正式的 -800/800 阈值不变。",
+    "refresh_leave_seconds": 0.6,
+    "hover_settle_seconds": 1.5,
+    "post_dungeon_extra_ocr_rounds": 3,
+    "ocr_retry_interval_seconds": 1.0
+  },
+  "combat": {
+    "_comment": "焦点波动导致单次战斗按键失败时增加重试；技能与拾取的正式周期不变。",
+    "input_retry_attempts": 5,
+    "input_retry_seconds": 0.3,
+    "boss_fatigue_probe_initial_delay_seconds": 20.0,
+    "boss_fatigue_probe_interval_seconds": 10.0
+  },
+  "dungeon_mount": {
+    "settle_seconds": 1.5
+  },
+  "inventory_automation": {
+    "_comment": "背包、杂货铺和售卖弹窗在低帧率设备上可能需要多帧才能完全绘制。",
+    "inventory_open_attempts": 3,
+    "inventory_open_retry_seconds": 1.0,
+    "inventory_open_seconds": 2.0,
+    "shop_open_seconds": 2.0,
+    "post_weapon_switch_seconds": 1.5,
+    "quantity_dialog_seconds": 1.2,
+    "quantity_confirm_attempts": 4,
+    "after_quantity_confirm_seconds": 1.2,
+    "after_sale_seconds": 1.5,
+    "panel_step_seconds": 1.0
+  },
+  "timing": {
+    "_comment": "地图展开、自动寻路、场景加载和退出均采用更保守的等待时间。",
+    "map_open_seconds": 0.6,
+    "normal_auto_path_seconds": 12.0,
+    "dungeon_load_seconds": 8.0,
+    "boss_auto_path_seconds": 20.0,
+    "boss_timeout_seconds": 210.0,
+    "exit_load_seconds": 8.0,
+    "panel_wait_seconds": 1.0,
+    "circle_click_interval_seconds": 0.6,
+    "combat_input_quiet_seconds": 0.6
+  },
+  "entrance": {
+    "max_circle_rounds": 4
+  },
+  "map_detection": {
+    "recovery_rounds": 3,
+    "recovery_settle_seconds": 1.5
+  },
+  "recovery": {
+    "_comment": "截图或游戏窗口短暂失效时允许更长时间自行恢复。",
+    "capture_retries": 7,
+    "capture_retry_seconds": 0.8,
+    "window_reconnect_attempts": 8,
+    "window_reconnect_interval_seconds": 3.0,
+    "scene_confirm_seconds": 8.0
+  },
+  "revive": {
+    "check_interval_seconds": 0.75,
+    "max_wait_seconds": 60.0,
+    "retry_settle_seconds": 1.5,
+    "post_revive_seconds": 2.0
+  }
+}
