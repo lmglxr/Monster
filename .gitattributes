@@ -1,5 +1,7 @@
 * text=auto
-*.bat text eol=crlf
+# Windows cmd.exe 对仅含 LF 的批处理解析不稳定。批处理按二进制保存，
+# 让仓库、GitHub ZIP 和所有工作区都保留文件中实际的 CRLF 字节。
+*.bat -text
 *.py text eol=lf
 *.json text eol=lf
 *.md text eol=lf
