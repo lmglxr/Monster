@@ -1,0 +1,43 @@
+{
+  "_comment": "完整链路冒烟测试专用参数。只在使用 --full-smoke-test --live 时读取，不会覆盖正式 config.json。为了快速覆盖完整流程，这些阈值明显小于正式挂机参数，请勿直接复制到正式配置。",
+  "smoke_test": {
+    "_comment": "冒烟测试自身的控制参数，不会合并到正式运行配置。",
+    "minimum_cycles": 2,
+    "_minimum_cycles_comment": "至少重复多少轮完整链路。命令行 --smoke-cycles 可以要求更多轮，但不能低于这个值。"
+  },
+  "fatigue": {
+    "_comment": "让测试无需等待正式的 -800/800 阈值即可快速触发普通刷怪、BOSS 恢复和返回刷怪的闭环。",
+    "low_threshold": 1000,
+    "_low_threshold_comment": "普通区识别到任意合法疲劳值后立即进入 BOSS 流程。",
+    "boss_target": -1000,
+    "_boss_target_comment": "退出一次副本并成功识别疲劳后即可结束本轮 BOSS 恢复流程。",
+    "check_interval_seconds": 1.0,
+    "_check_interval_seconds_comment": "普通刷怪阶段每秒检查一次疲劳，加快测试触发速度。",
+    "post_dungeon_extra_ocr_rounds": 1,
+    "_post_dungeon_extra_ocr_rounds_comment": "退出副本后的首次识别失败时，再额外刷新识别一轮。"
+  },
+  "boss_loop": {
+    "minimum_runs": 1,
+    "_minimum_runs_comment": "每轮冒烟测试只要求完成一次副本；正式配置仍保持至少十次。"
+  },
+  "entrance": {
+    "portal_match_threshold": 0.43,
+    "_portal_match_threshold_comment": "冒烟测试入口光圈模板阈值。实测 0.43 可覆盖约 0.44 的弱匹配，同时避免进一步放宽导致明显误识别。"
+  },
+  "combat": {
+    "_comment": "缩短 A、Space、Q、W 的触发间隔，用较短时间确认四个独立按键调度器都实际运行。",
+    "pickup_interval_seconds": 0.35,
+    "boss_pickup_interval_seconds": 0.35,
+    "skill_q_interval_seconds": 0.8,
+    "skill_w_interval_seconds": 1.2,
+    "skill_q_initial_delay_seconds": 0.1,
+    "skill_w_initial_delay_seconds": 0.2
+  },
+  "timing": {
+    "_comment": "缩短已实测稳定的加载和等待时间；BOSS 超时仍保留 90 秒，避免测试环境短暂卡顿时过早退出。",
+    "dungeon_load_seconds": 4.0,
+    "boss_auto_path_seconds": 12.0,
+    "exit_load_seconds": 4.0,
+    "boss_timeout_seconds": 90.0
+  }
+}

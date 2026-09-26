@@ -1,0 +1,13 @@
+{
+  "_comment": "背包装备与物品维护的个人坐标模板。正式校准值将保存在 inventory_profile.json 中且不会提交到 GitHub，从而与地图/BOSS 坐标解耦。所有点位均为游戏客户区归一化坐标 [x, y]。",
+  "inventory_grid_top_left": null,
+  "_inventory_grid_top_left_comment": "背包物品网格左上角。程序只在此点与右下角构成的区域内寻找两把武器和目标药品，不依赖物品售出后的固定格位。",
+  "inventory_grid_bottom_right": null,
+  "_inventory_grid_bottom_right_comment": "背包物品网格右下角。应覆盖所有可能出现物品的格子，但不要包含左侧杂货铺。",
+  "shop_button": null,
+  "_shop_button_comment": "正常 HUD 顶部的‘杂货铺’按钮中心。背包打开时点击它会同时显示杂货铺。",
+  "sell_slot": null,
+  "_sell_slot_comment": "杂货铺底部回收栏中的第一个空方框中心；程序会把药品持续按住并拖到这里。",
+  "sell_all_button": null,
+  "_sell_all_button_comment": "杂货铺回收栏右侧的‘全部出售’按钮中心，用于完成最终交易。"
+}

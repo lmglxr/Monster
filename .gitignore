@@ -6,4 +6,5 @@ __pycache__/
 
 # Runtime diagnostics are local-only and may grow over time.
 debug/
+inventory_profile.json
 runtime.log

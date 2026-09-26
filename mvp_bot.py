@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from copy import deepcopy
 from contextlib import contextmanager
 import ctypes
 import json
@@ -31,6 +32,9 @@ import winerror
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
+SMOKE_CONFIG_PATH = APP_DIR / "smoke_test_config.json"
+INVENTORY_PROFILE_PATH = APP_DIR / "inventory_profile.json"
+INVENTORY_PROFILE_EXAMPLE_PATH = APP_DIR / "inventory_profile.example.json"
 ASSET_DIR = APP_DIR / "assets"
 RUNTIME_LOG = APP_DIR / "runtime.log"
 DEBUG_DIR = APP_DIR / "debug"
@@ -38,6 +42,10 @@ APP_VERSION = "0.0.2"
 
 VK = {
     "A": 0x41,
+    "B": 0x42,
+    "F": 0x46,
+    "Q": 0x51,
+    "W": 0x57,
     "SPACE": win32con.VK_SPACE,
     "ESC": win32con.VK_ESCAPE,
     "F2": win32con.VK_F2,
@@ -77,6 +85,24 @@ def save_config(cfg: dict) -> None:
         f.write("\n")
 
 
+def load_inventory_profile() -> dict:
+    """加载每位玩家单独校准的背包坐标；缺失时安全返回空配置。"""
+    if not INVENTORY_PROFILE_PATH.exists():
+        return {}
+    try:
+        with INVENTORY_PROFILE_PATH.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logging.warning("个人背包坐标文件读取失败，将禁用本轮背包自动化：%s", exc)
+        return {}
+
+
+def save_inventory_profile(profile: dict) -> None:
+    with INVENTORY_PROFILE_PATH.open("w", encoding="utf-8") as f:
+        json.dump(profile, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
 def pressed(vk: int) -> bool:
     return bool(win32api.GetAsyncKeyState(vk) & 0x8000)
 
@@ -106,6 +132,8 @@ class GameWindow:
     reconnect_epoch: int = 0
     input_mode: str = "foreground_only"
     focus_settle_seconds: float = 0.08
+    focus_activation_attempts: int = 3
+    focus_activation_retry_seconds: float = 0.08
     post_input_seconds: float = 0.12
     restore_previous_window: bool = True
     capture_mode: str = "screen"
@@ -255,12 +283,26 @@ class GameWindow:
         self._previous_foreground = win32gui.GetForegroundWindow()
         self._previous_cursor = win32api.GetCursorPos()
         self._last_bot_cursor = None
-        if self._previous_foreground != self.hwnd:
-            self._activate_window(self.hwnd)
+        activation_error: Optional[Exception] = None
+        for attempt in range(1, max(1, self.focus_activation_attempts) + 1):
+            if win32gui.GetForegroundWindow() == self.hwnd:
+                break
+            try:
+                self._activate_window(self.hwnd)
+            except Exception as exc:
+                activation_error = exc
             time.sleep(max(0.0, self.focus_settle_seconds))
+            if win32gui.GetForegroundWindow() == self.hwnd:
+                break
+            if attempt < max(1, self.focus_activation_attempts):
+                time.sleep(max(0.0, self.focus_activation_retry_seconds))
         if win32gui.GetForegroundWindow() != self.hwnd:
             self._input_session_depth = 0
-            raise RuntimeError("无法临时切换到游戏窗口，已取消本次输入以避免误操作。")
+            detail = f"：{activation_error}" if activation_error else ""
+            raise RuntimeError(
+                f"连续 {max(1, self.focus_activation_attempts)} 次无法临时切换到游戏窗口，"
+                f"已取消本次输入以避免误操作{detail}"
+            )
         if not self._focus_notice_logged:
             logging.warning(
                 "焦点脉冲模式已启用：发送输入时会短暂切到游戏，随后恢复原窗口和鼠标。"
@@ -394,6 +436,58 @@ class GameWindow:
 
     def click_normalized(self, point: list[float], live: bool = True) -> None:
         self.click_client(*self.normalized_to_client(point), live=live)
+
+    def double_click_normalized(
+        self,
+        point: list[float],
+        interval_seconds: float = 0.12,
+        live: bool = True,
+    ) -> None:
+        x, y = self.normalized_to_client(point)
+        if not live:
+            logging.info("DRY double click (%s, %s)", x, y)
+            return
+        with self.input_session(live=True):
+            self.move_client(x, y, live=True)
+            for click_index in range(2):
+                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+                time.sleep(0.05)
+                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+                if click_index == 0:
+                    time.sleep(max(0.05, interval_seconds))
+            if self.supports_focus_pulse:
+                time.sleep(max(0.0, self.post_input_seconds))
+
+    def drag_normalized(
+        self,
+        source: list[float],
+        target: list[float],
+        hold_seconds: float = 0.35,
+        live: bool = True,
+    ) -> None:
+        sx, sy = self.normalized_to_client(source)
+        tx, ty = self.normalized_to_client(target)
+        if not live:
+            logging.info("DRY drag (%s, %s) -> (%s, %s)", sx, sy, tx, ty)
+            return
+        with self.input_session(live=True):
+            self.move_client(sx, sy, live=True)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            time.sleep(0.12)
+            steps = max(4, int(max(0.2, hold_seconds) / 0.04))
+            ox, oy = self.client_origin()
+            for step in range(1, steps + 1):
+                ratio = step / steps
+                point = (
+                    ox + int(round(sx + (tx - sx) * ratio)),
+                    oy + int(round(sy + (ty - sy) * ratio)),
+                )
+                win32api.SetCursorPos(point)
+                self._last_bot_cursor = point
+                time.sleep(max(0.01, hold_seconds / steps))
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            if self.supports_focus_pulse:
+                time.sleep(max(0.0, self.post_input_seconds))
 
     def tap_key(self, name: str, hold_seconds: float = 0.05, live: bool = True) -> None:
         vk = VK[name.upper()]
@@ -628,6 +722,12 @@ class Bot:
             focus_settle_seconds=float(
                 window_cfg.get("focus_settle_seconds", 0.08)
             ),
+            focus_activation_attempts=max(
+                1, int(window_cfg.get("focus_activation_attempts", 3))
+            ),
+            focus_activation_retry_seconds=float(
+                window_cfg.get("focus_activation_retry_seconds", 0.08)
+            ),
             post_input_seconds=float(window_cfg.get("post_input_seconds", 0.12)),
             restore_previous_window=bool(
                 window_cfg.get("restore_previous_window", True)
@@ -644,6 +744,15 @@ class Bot:
         self.panel_template = self._load_gray_template("entry_panel_title.png")
         self.map_template = self._load_gray_template("map_open_indicator.png")
         self.revive_template = self._load_gray_template("revive_panel_title.png")
+        self.inventory_template = self._load_gray_template("inventory_panel_title.png")
+        self.shop_template = self._load_gray_template("general_store_title.png")
+        self.sell_quantity_template = self._load_gray_template("sell_quantity_title.png")
+        self.medicine_item_template = self._load_gray_template("medicine_item_icon.png")
+        self.weapon_variant_templates = {
+            "a": self._load_gray_template("weapon_variant_a_icon.png"),
+            "b": self._load_gray_template("weapon_variant_b_icon.png"),
+        }
+        self.inventory_profile = load_inventory_profile()
         self.running = False
         self.stopped = False
         self.last_fatigue: Optional[int] = None
@@ -653,6 +762,9 @@ class Bot:
         self._f8_down = False
         self._f12_down = False
         self._window_reconnect_epoch = self.window.reconnect_epoch
+        self._boss_weapon_active = False
+        self._inventory_missing_warned = False
+        self.combat_input_counts: Counter[str] = Counter()
 
     @staticmethod
     def _load_gray_template(name: str) -> Optional[np.ndarray]:
@@ -759,12 +871,102 @@ class Bot:
         if not combat:
             self.window.release_keys(("A", "SPACE"), live=self.live)
 
-    def tap_combat_key(self, name: str, hold_seconds: float = 0.05) -> None:
+    def tap_combat_key(self, name: str, hold_seconds: float = 0.05) -> bool:
         if self.phase not in ("normal_combat", "boss_combat"):
             raise RuntimeError(f"输入隔离阻止了在 {self.phase} 阶段发送战斗按键 {name}。")
-        self.window.ensure()
-        self._confirm_reconnected_window()
-        self.window.tap_key(name, hold_seconds=hold_seconds, live=self.live)
+        combat = self.cfg.get("combat", {})
+        attempts = max(1, int(combat.get("input_retry_attempts", 3)))
+        retry_seconds = max(0.05, float(combat.get("input_retry_seconds", 0.15)))
+        for attempt in range(1, attempts + 1):
+            try:
+                self.window.ensure()
+                self._confirm_reconnected_window()
+                self.window.tap_key(name, hold_seconds=hold_seconds, live=self.live)
+                self.combat_input_counts[name.upper()] += 1
+                return True
+            except RuntimeError as exc:
+                if attempt >= attempts:
+                    logging.warning(
+                        "战斗按键 %s 连续 %s 次发送失败，本次跳过并在下一周期继续：%s",
+                        name,
+                        attempts,
+                        exc,
+                    )
+                    return False
+                logging.warning(
+                    "战斗按键 %s 第 %s/%s 次发送失败，%.2f 秒后重试：%s",
+                    name,
+                    attempt,
+                    attempts,
+                    retry_seconds,
+                    exc,
+                )
+                time.sleep(retry_seconds)
+        return False
+
+    def new_combat_schedule(self, boss: bool = False) -> dict[str, float]:
+        """为 A、Space、Q、W 建立彼此独立的下一次执行时间。"""
+        combat = self.cfg["combat"]
+        now = time.monotonic()
+        return {
+            "attack": now,
+            "pickup": now + float(combat.get("pickup_initial_delay_seconds", 0.2)),
+            "skill_q": now + float(combat.get("skill_q_initial_delay_seconds", 1.0)),
+            "skill_w": now + float(combat.get("skill_w_initial_delay_seconds", 2.0)),
+            "boss": 1.0 if boss else 0.0,
+        }
+
+    def run_due_combat_inputs(self, schedule: dict[str, float]) -> None:
+        """执行当前到期的战斗输入；任一技能冷却都不会阻塞其他按键。"""
+        combat = self.cfg["combat"]
+        boss = bool(schedule.get("boss", 0.0))
+        now = time.monotonic()
+        actions = [
+            (
+                "attack",
+                True,
+                str(combat.get("attack_key", "A")),
+                float(combat.get("attack_interval_seconds", 0.45)),
+            ),
+            (
+                "skill_q",
+                bool(combat.get("skill_q_enabled", True)),
+                str(combat.get("skill_q_key", "Q")),
+                float(combat.get("skill_q_interval_seconds", 6.0)),
+            ),
+            (
+                "skill_w",
+                bool(combat.get("skill_w_enabled", True)),
+                str(combat.get("skill_w_key", "W")),
+                float(combat.get("skill_w_interval_seconds", 12.0)),
+            ),
+            (
+                "pickup",
+                True,
+                str(combat.get("pickup_key", "SPACE")),
+                float(
+                    combat.get(
+                        "boss_pickup_interval_seconds" if boss else "pickup_interval_seconds",
+                        combat.get("pickup_interval_seconds", 0.8),
+                    )
+                ),
+            ),
+        ]
+        for action_name, enabled, key, interval in actions:
+            if not enabled or now < schedule[action_name]:
+                continue
+            sent = self.tap_combat_key(
+                key,
+                hold_seconds=float(combat.get("combat_key_hold_seconds", 0.05)),
+            )
+            if sent and action_name.startswith("skill_"):
+                logging.debug("战斗技能 %s 已发送，下次间隔 %.2f 秒。", key, interval)
+            if sent:
+                schedule[action_name] = time.monotonic() + max(0.05, interval)
+            else:
+                schedule[action_name] = time.monotonic() + max(
+                    0.05, float(combat.get("input_retry_seconds", 0.15))
+                )
 
     def revive_panel_visible(
         self, frame: Optional[np.ndarray] = None
@@ -960,6 +1162,332 @@ class Bot:
         logging.debug("副本面板匹配分数 %.3f", score)
         return score >= self.cfg["entrance"]["panel_match_threshold"]
 
+    def ui_template_visible(
+        self, template: Optional[np.ndarray], threshold: float
+    ) -> tuple[bool, float]:
+        if template is None:
+            return False, 0.0
+        _, score = self.template_match(self.capture_frame(), template)
+        return score >= threshold, score
+
+    def find_inventory_icon(
+        self, templates: dict[str, Optional[np.ndarray]]
+    ) -> tuple[Optional[str], Optional[list[float]], float]:
+        """在个人校准的背包网格内寻找图标，允许售卖后的物品自动重排。"""
+        top_left = self.inventory_profile.get("inventory_grid_top_left")
+        bottom_right = self.inventory_profile.get("inventory_grid_bottom_right")
+        if not top_left or not bottom_right:
+            return None, None, 0.0
+        frame = self.capture_frame()
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        height, width = gray.shape
+        x1, y1 = int(top_left[0] * width), int(top_left[1] * height)
+        x2, y2 = int(bottom_right[0] * width), int(bottom_right[1] * height)
+        x1, x2 = sorted((max(0, x1), min(width, x2)))
+        y1, y2 = sorted((max(0, y1), min(height, y2)))
+        crop = gray[y1:y2, x1:x2]
+        reference_width = float(self.cfg.get("reference_client_size", [1280, 720])[0])
+        scale = width / reference_width
+        best_name: Optional[str] = None
+        best_point: Optional[list[float]] = None
+        best_score = -1.0
+        for name, template in templates.items():
+            if template is None:
+                continue
+            resized = cv2.resize(
+                template,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC,
+            )
+            if crop.shape[0] < resized.shape[0] or crop.shape[1] < resized.shape[1]:
+                continue
+            _, score, _, location = cv2.minMaxLoc(
+                cv2.matchTemplate(crop, resized, cv2.TM_CCOEFF_NORMED)
+            )
+            if score > best_score:
+                center_x = x1 + location[0] + resized.shape[1] // 2
+                center_y = y1 + location[1] + resized.shape[0] // 2
+                best_name = name
+                best_point = [center_x / width, center_y / height]
+                best_score = float(score)
+        return best_name, best_point, best_score
+
+    def find_sell_confirm_button(self) -> tuple[Optional[list[float]], float]:
+        """在售卖数量弹窗中按橙色按钮形状定位“确认”，不依赖弹窗固定坐标。"""
+        action_cfg = self.cfg.get("inventory_automation", {})
+        frame = self.capture_frame()
+        height, width = frame.shape[:2]
+        region = action_cfg.get("quantity_confirm_search_region", [0.30, 0.50, 0.48, 0.72])
+        x1, y1 = int(region[0] * width), int(region[1] * height)
+        x2, y2 = int(region[2] * width), int(region[3] * height)
+        crop = frame[y1:y2, x1:x2]
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        low = np.array(action_cfg.get("confirm_orange_hsv_low", [5, 100, 100]), dtype=np.uint8)
+        high = np.array(action_cfg.get("confirm_orange_hsv_high", [30, 255, 255]), dtype=np.uint8)
+        mask = cv2.inRange(hsv, low, high)
+        count, _, stats, centroids = cv2.connectedComponentsWithStats(mask)
+        best_point: Optional[list[float]] = None
+        best_score = 0.0
+        for index in range(1, count):
+            left, top, box_width, box_height, area = stats[index]
+            width_ratio = box_width / width
+            height_ratio = box_height / height
+            if not (0.06 <= width_ratio <= 0.12 and 0.035 <= height_ratio <= 0.08):
+                continue
+            fill_ratio = area / max(1, box_width * box_height)
+            if fill_ratio < 0.45:
+                continue
+            center_x = x1 + float(centroids[index][0])
+            center_y = y1 + float(centroids[index][1])
+            score = fill_ratio * min(1.0, area / 2500.0)
+            if score > best_score:
+                best_score = score
+                best_point = [center_x / width, center_y / height]
+        return best_point, best_score
+
+    def inventory_actions_available(self, required: tuple[str, ...]) -> bool:
+        action_cfg = self.cfg.get("inventory_automation", {})
+        if not bool(action_cfg.get("enabled", False)):
+            return False
+        missing = [name for name in required if not self.inventory_profile.get(name)]
+        if missing:
+            if not self._inventory_missing_warned:
+                logging.warning(
+                    "背包自动化尚未校准（缺少 %s），本次将安全跳过；请运行“校准背包装备.bat”。",
+                    ", ".join(missing),
+                )
+                self._inventory_missing_warned = True
+            return False
+        return True
+
+    def close_optional_panels(self) -> None:
+        """按需用 ESC 收起数量框、商店和背包，不在 HUD 上多按 ESC。"""
+        action_cfg = self.cfg.get("inventory_automation", {})
+        threshold = float(action_cfg.get("panel_match_threshold", 0.85))
+        templates = (
+            self.sell_quantity_template,
+            self.shop_template,
+            self.inventory_template,
+        )
+        for _ in range(max(1, int(action_cfg.get("close_escape_presses", 3)))):
+            if not any(
+                self.ui_template_visible(template, threshold)[0]
+                for template in templates
+                if template is not None
+            ):
+                return
+            self.window.tap_key("ESC", live=self.live)
+            time.sleep(max(0.05, float(action_cfg.get("panel_step_seconds", 0.6))))
+
+    def open_inventory_checked(self) -> bool:
+        action_cfg = self.cfg.get("inventory_automation", {})
+        threshold = float(action_cfg.get("panel_match_threshold", 0.72))
+        visible, _ = self.ui_template_visible(self.inventory_template, threshold)
+        if visible:
+            return True
+        attempts = max(1, int(action_cfg.get("inventory_open_attempts", 2)))
+        score = 0.0
+        for attempt in range(1, attempts + 1):
+            self.window.tap_key(
+                str(action_cfg.get("open_key", "B")),
+                hold_seconds=float(action_cfg.get("open_key_hold_seconds", 0.12)),
+                live=self.live,
+            )
+            self.wait(float(action_cfg.get("inventory_open_seconds", 1.2)))
+            visible, score = self.ui_template_visible(self.inventory_template, threshold)
+            if visible:
+                return True
+            if attempt < attempts:
+                self.wait(float(action_cfg.get("inventory_open_retry_seconds", 0.5)))
+                # 再截一次，避免背包只是显示较慢而第二次 B 反而将其关闭。
+                visible, score = self.ui_template_visible(
+                    self.inventory_template, threshold
+                )
+                if visible:
+                    return True
+        logging.warning(
+            "连续 %s 次按 B 后仍未确认背包已打开（匹配分数 %.3f），跳过本次背包操作。",
+            attempts,
+            score,
+        )
+        return False
+
+    def switch_weapon(self, target: str) -> bool:
+        """同一格双击可在两把主武器间切换；target 只用于维护流程状态。"""
+        if target not in ("boss", "farm"):
+            raise ValueError(f"未知武器目标：{target}")
+        if (target == "boss") == self._boss_weapon_active:
+            return True
+        grid_keys = ("inventory_grid_top_left", "inventory_grid_bottom_right")
+        if not self.inventory_actions_available(grid_keys):
+            return False
+        action_cfg = self.cfg.get("inventory_automation", {})
+        try:
+            self.set_phase("inventory_weapon_switch")
+            if not self.open_inventory_checked():
+                return False
+            before_name, weapon_point, before_score = self.find_inventory_icon(
+                self.weapon_variant_templates
+            )
+            weapon_threshold = float(action_cfg.get("weapon_match_threshold", 0.78))
+            if weapon_point is None or before_score < weapon_threshold:
+                logging.warning(
+                    "背包网格内未可靠识别换武器图标（匹配分数 %.3f），保留当前武器。",
+                    before_score,
+                )
+                return False
+            logging.info(
+                "识别到换武器图标 %s（%.3f），双击切换为%s武器。",
+                before_name,
+                before_score,
+                "BOSS" if target == "boss" else "刷怪",
+            )
+            self.window.double_click_normalized(
+                weapon_point,
+                interval_seconds=float(action_cfg.get("double_click_interval_seconds", 0.12)),
+                live=self.live,
+            )
+            self.wait(float(action_cfg.get("post_weapon_switch_seconds", 0.8)))
+            after_name, _, after_score = self.find_inventory_icon(
+                self.weapon_variant_templates
+            )
+            if (
+                after_name is None
+                or after_score < weapon_threshold
+                or after_name == before_name
+            ):
+                logging.warning(
+                    "双击后未确认武器图标已改变（切换前 %s，切换后 %s/%.3f），不更新内部装备状态。",
+                    before_name,
+                    after_name,
+                    after_score,
+                )
+                return False
+            self._boss_weapon_active = target == "boss"
+            return True
+        except Exception as exc:
+            logging.warning("切换%s武器失败，将保留当前武器继续流程：%s", target, exc)
+            return False
+        finally:
+            try:
+                self.close_optional_panels()
+            except Exception as exc:
+                logging.warning("切换武器后的面板收尾失败；主流程仍将继续：%s", exc)
+
+    def sell_cycle_medicine(self) -> bool:
+        """每个完整疲劳循环结束后出售一次第一格药品；识别失败则安全跳过。"""
+        required = (
+            "inventory_grid_top_left",
+            "inventory_grid_bottom_right",
+            "shop_button",
+            "sell_slot",
+            "sell_all_button",
+        )
+        if not self.inventory_actions_available(required):
+            return False
+        action_cfg = self.cfg.get("inventory_automation", {})
+        threshold = float(action_cfg.get("panel_match_threshold", 0.72))
+        try:
+            self.set_phase("inventory_cycle_sale")
+            if not self.open_inventory_checked():
+                return False
+            logging.info("完整疲劳循环结束：打开杂货铺，准备出售药品。")
+            self.window.click_normalized(self.inventory_profile["shop_button"], live=self.live)
+            self.wait(float(action_cfg.get("shop_open_seconds", 1.0)))
+            shop_visible, shop_score = self.ui_template_visible(self.shop_template, threshold)
+            if not shop_visible:
+                logging.warning("未确认杂货铺已打开（匹配分数 %.3f），取消本次售卖。", shop_score)
+                return False
+
+            _, medicine_point, medicine_score = self.find_inventory_icon(
+                {"medicine": self.medicine_item_template}
+            )
+            medicine_threshold = float(action_cfg.get("medicine_match_threshold", 0.76))
+            if medicine_point is None or medicine_score < medicine_threshold:
+                logging.warning(
+                    "背包网格内未确认目标药品（匹配分数 %.3f）；为避免卖错物品，本轮不拖拽。",
+                    medicine_score,
+                )
+                return False
+
+            self.window.drag_normalized(
+                medicine_point,
+                self.inventory_profile["sell_slot"],
+                hold_seconds=float(action_cfg.get("drag_seconds", 0.45)),
+                live=self.live,
+            )
+            self.wait(float(action_cfg.get("quantity_dialog_seconds", 0.7)))
+            dialog_visible, dialog_score = self.ui_template_visible(
+                self.sell_quantity_template, threshold
+            )
+            if not dialog_visible:
+                logging.warning(
+                    "拖拽后未出现售卖数量框（匹配分数 %.3f）；可能药品格为空，取消本次售卖。",
+                    dialog_score,
+                )
+                return False
+            # 数量框默认选中整组最大数量。弹窗在不同实机上的纵向位置
+            # 有偏差，因此识别橙色按钮并在点击后确认弹窗真的消失。
+            confirm_attempts = max(
+                1, int(action_cfg.get("quantity_confirm_attempts", 3))
+            )
+            confirmed = False
+            for confirm_attempt in range(1, confirm_attempts + 1):
+                confirm_point, confirm_score = self.find_sell_confirm_button()
+                if confirm_point is None:
+                    logging.warning(
+                        "第 %s/%s 次未定位到橙色售卖确认按钮（形状分数 %.3f）。",
+                        confirm_attempt,
+                        confirm_attempts,
+                        confirm_score,
+                    )
+                    break
+                logging.info(
+                    "点击售卖数量确认按钮：位置 %s，形状分数 %.3f。",
+                    [round(value, 4) for value in confirm_point],
+                    confirm_score,
+                )
+                self.window.click_normalized(confirm_point, live=self.live)
+                self.wait(
+                    float(action_cfg.get("after_quantity_confirm_seconds", 0.7))
+                )
+                still_visible, _ = self.ui_template_visible(
+                    self.sell_quantity_template, threshold
+                )
+                if not still_visible:
+                    confirmed = True
+                    break
+                logging.warning("点击后售卖数量弹窗仍存在，将重新定位并重试。")
+            if not confirmed:
+                logging.warning("未能确认售卖数量弹窗已经关闭，本轮不会点击‘全部出售’。")
+                return False
+
+            self.window.click_normalized(
+                self.inventory_profile["sell_all_button"], live=self.live
+            )
+            self.wait(float(action_cfg.get("after_sale_seconds", 1.0)))
+            _, remaining_point, remaining_score = self.find_inventory_icon(
+                {"medicine": self.medicine_item_template}
+            )
+            if remaining_point is not None and remaining_score >= medicine_threshold:
+                logging.warning(
+                    "点击‘全部出售’后背包中仍识别到目标药品（%.3f），不记录为售卖成功。",
+                    remaining_score,
+                )
+                return False
+            logging.info("药品已从背包网格消失，确认售卖完成。")
+            return True
+        except Exception as exc:
+            logging.warning("药品售卖失败；不中断挂机，将在下一完整循环再次尝试：%s", exc)
+            return False
+        finally:
+            try:
+                self.close_optional_panels()
+            except Exception as exc:
+                logging.warning("售药后的面板收尾失败；主流程仍将继续：%s", exc)
+
     def map_visible(self) -> bool:
         _, score = self.template_match(self.capture_frame(), self.map_template)
         logging.info("地图打开状态匹配分数 %.3f", score)
@@ -1122,9 +1650,7 @@ class Bot:
     def normal_farm_until_low(self) -> None:
         logging.info("状态：普通区域挂机。")
         self.set_phase("normal_combat", combat=True)
-        combat = self.cfg["combat"]
-        next_attack = 0.0
-        next_pickup = 0.0
+        schedule = self.new_combat_schedule(boss=False)
         next_fatigue = 0.0
         while not self.stopped:
             self.check_control_keys()
@@ -1142,16 +1668,10 @@ class Bot:
                     time.sleep(0.2)
                 continue
             if self.check_and_handle_revive():
-                next_attack = time.monotonic()
-                next_pickup = time.monotonic()
+                schedule = self.new_combat_schedule(boss=False)
                 continue
             now = time.monotonic()
-            if now >= next_attack:
-                self.tap_combat_key(combat["attack_key"])
-                next_attack = now + combat["attack_interval_seconds"]
-            if now >= next_pickup:
-                self.tap_combat_key(combat["pickup_key"])
-                next_pickup = now + combat["pickup_interval_seconds"]
+            self.run_due_combat_inputs(schedule)
             if now >= next_fatigue:
                 fatigue = self.read_fatigue()
                 next_fatigue = now + self.cfg["fatigue"]["check_interval_seconds"]
@@ -1179,6 +1699,24 @@ class Bot:
         self.trigger_entrance_panel()
         self.click("enter_dungeon_button")
         self.wait(self.cfg["timing"]["dungeon_load_seconds"])
+        self.mount_for_dungeon()
+
+    def mount_for_dungeon(self) -> None:
+        """进入副本后骑乘宠物；此动作只依赖快捷键，不依赖任何屏幕坐标。"""
+        mount_cfg = self.cfg.get("dungeon_mount", {})
+        if not bool(mount_cfg.get("enabled", True)) or self.stopped:
+            return
+        key = str(mount_cfg.get("key", "F")).upper()
+        if key not in VK:
+            raise RuntimeError(f"骑乘快捷键 {key!r} 不受支持，请检查 dungeon_mount.key。")
+        logging.info("状态：进入副本后按 %s 骑乘宠物。", key)
+        self.set_phase("dungeon_mounting")
+        self.window.tap_key(
+            key,
+            hold_seconds=max(0.02, float(mount_cfg.get("hold_seconds", 0.08))),
+            live=self.live,
+        )
+        self.wait(max(0.0, float(mount_cfg.get("settle_seconds", 0.8))))
 
     def travel_to_boss(self) -> None:
         logging.info("状态：副本内地图寻路到 BOSS。")
@@ -1197,24 +1735,87 @@ class Bot:
         self.set_phase("boss_combat", combat=True)
         self.log_tail.boss_seen = False
         self.log_tail.boss_dead = False
+        combat_cfg = self.cfg["combat"]
+        fatigue_fallback_enabled = bool(
+            combat_cfg.get("boss_fatigue_fallback_enabled", True)
+        )
+        fatigue_baseline = self.last_fatigue
+        if fatigue_fallback_enabled and fatigue_baseline is None:
+            logging.info("尚无战前疲劳基准，先读取一次用于 BOSS 死亡兜底判断。")
+            fatigue_baseline = self.read_fatigue(attempts=3, refresh_rounds=1)
+        fatigue_probe_delay = max(
+            1.0,
+            float(combat_cfg.get("boss_fatigue_probe_initial_delay_seconds", 12.0)),
+        )
+        fatigue_probe_interval = max(
+            1.0,
+            float(combat_cfg.get("boss_fatigue_probe_interval_seconds", 8.0)),
+        )
+        fatigue_gain_threshold = max(
+            1,
+            int(combat_cfg.get("boss_fatigue_gain_threshold", 40)),
+        )
+        next_fatigue_probe = time.monotonic() + fatigue_probe_delay
         deadline = time.monotonic() + self.cfg["timing"]["boss_timeout_seconds"]
         revive_epoch = self.revive_epoch
+        schedule = self.new_combat_schedule(boss=True)
         while time.monotonic() < deadline and not self.stopped:
             if self.check_and_handle_revive():
                 deadline = time.monotonic() + self.cfg["timing"]["boss_timeout_seconds"]
                 revive_epoch = self.revive_epoch
+                schedule = self.new_combat_schedule(boss=True)
                 continue
-            self.tap_combat_key(self.cfg["combat"]["attack_key"])
+            self.run_due_combat_inputs(schedule)
             self.log_tail.poll()
             if self.log_tail.boss_seen:
                 logging.info("日志已识别 BOSS 实体 %s。", self.cfg["combat"]["boss_entity_id"])
             if self.log_tail.boss_dead:
                 logging.info("日志确认 BOSS 已死亡。")
                 return True
-            self.wait(self.cfg["combat"]["attack_interval_seconds"])
+            now = time.monotonic()
+            if (
+                fatigue_fallback_enabled
+                and fatigue_baseline is not None
+                and now >= next_fatigue_probe
+            ):
+                # 某些游戏运行状态不再向 Player.log 输出战斗诊断。BOSS 击杀
+                # 仍会立即恢复约 100 点疲劳，因此用战前值作独立兜底。第一次
+                # 达到阈值后立刻再读一次，避免一次 OCR 误读导致提前退出。
+                fatigue = self.read_fatigue(attempts=3, refresh_rounds=1)
+                if (
+                    fatigue is not None
+                    and fatigue - fatigue_baseline >= fatigue_gain_threshold
+                ):
+                    confirmed_fatigue = self.read_fatigue(
+                        attempts=2, refresh_rounds=1
+                    )
+                    if (
+                        confirmed_fatigue is not None
+                        and confirmed_fatigue - fatigue_baseline
+                        >= fatigue_gain_threshold
+                    ):
+                        logging.info(
+                            "疲劳从 %s 恢复到 %s，连续两次确认增量达到 %s；"
+                            "判定 BOSS 已死亡。",
+                            fatigue_baseline,
+                            confirmed_fatigue,
+                            fatigue_gain_threshold,
+                        )
+                        return True
+                    logging.warning(
+                        "BOSS 疲劳增量第一次达到阈值，但复核值为 %s；"
+                        "继续战斗并等待下一轮确认。",
+                        confirmed_fatigue,
+                    )
+                # OCR 会占用数秒，重新建立调度，避免恢复战斗时一次性补发
+                # 已经过期的 A、Q、W、Space。
+                schedule = self.new_combat_schedule(boss=True)
+                next_fatigue_probe = time.monotonic() + fatigue_probe_interval
+            self.wait(0.03)
             if self.revive_epoch != revive_epoch:
                 deadline = time.monotonic() + self.cfg["timing"]["boss_timeout_seconds"]
                 revive_epoch = self.revive_epoch
+                next_fatigue_probe = time.monotonic() + fatigue_probe_delay
         if self.stopped:
             return False
         logging.warning(
@@ -1249,6 +1850,7 @@ class Bot:
             self.travel_to_first_entrance()
             self.enter_dungeon()
             self.travel_to_boss()
+            self.switch_weapon("boss")
             boss_defeated = self.fight_boss()
             if self.stopped:
                 return
@@ -1285,6 +1887,10 @@ class Bot:
                 continue
             if fatigue >= self.cfg["fatigue"]["boss_target"]:
                 logging.info("疲劳已恢复到 %s，结束 BOSS 循环。", fatigue)
+                # 先切回刷怪武器，再出售第一格药品。售出物品后背包会自动
+                # 紧凑排列，因此必须保持这个顺序，避免武器格提前发生位移。
+                self.switch_weapon("farm")
+                self.sell_cycle_medicine()
                 return
             logging.info("疲劳仍为 %s，准备再次进入副本。", fatigue)
 
@@ -1295,6 +1901,7 @@ class Bot:
             self.travel_to_first_entrance()
             self.enter_dungeon()
             self.travel_to_boss()
+            self.switch_weapon("boss")
             boss_defeated = self.fight_boss()
             if self.stopped:
                 return
@@ -1363,6 +1970,29 @@ CALIBRATION_STEPS = [
     ("confirm_exit_button", "打开退出确认框：把鼠标移到红色“确认”按钮中心"),
 ]
 
+INVENTORY_CALIBRATION_STEPS = [
+    (
+        "inventory_grid_top_left",
+        "按 B 打开背包，把鼠标移到第一排第一列物品格的左上角",
+    ),
+    (
+        "inventory_grid_bottom_right",
+        "保持背包打开，把鼠标移到当前可见背包网格最后一格的右下角（覆盖整个物品区域）",
+    ),
+    (
+        "shop_button",
+        "保持背包打开，把鼠标移到画面顶部的‘杂货铺’按钮中心",
+    ),
+    (
+        "sell_slot",
+        "手动打开杂货铺，把鼠标移到左侧窗口底部回收栏的第一个空方框中心",
+    ),
+    (
+        "sell_all_button",
+        "把鼠标移到回收栏右侧的‘全部出售’按钮中心",
+    ),
+]
+
 
 def calibrate(cfg: dict) -> None:
     window = GameWindow(cfg["window_title"])
@@ -1420,6 +2050,36 @@ def calibrate_map_button(cfg: dict) -> None:
     save_config(cfg)
     winsound.Beep(1000, 250)
     print(f"小地图位置已记录：客户区 ({cx}, {cy})，配置 {cfg['coordinates']['map_button']}")
+
+
+def calibrate_inventory(cfg: dict) -> None:
+    """只记录个人背包/商店坐标，不修改主流程地图坐标。"""
+    window = GameWindow(cfg["window_title"])
+    window.locate()
+    w, h = window.client_size()
+    if INVENTORY_PROFILE_PATH.exists():
+        profile = load_inventory_profile()
+    else:
+        with INVENTORY_PROFILE_EXAMPLE_PATH.open("r", encoding="utf-8") as f:
+            profile = json.load(f)
+    print(f"找到游戏客户区：{w}x{h}")
+    print("本流程只记录坐标，不会点击、拖拽或出售任何物品。")
+    print("每一步按说明手动准备界面，把鼠标放到目标中心后按 F2；按 F12 取消。\n")
+    for name, instruction in INVENTORY_CALIBRATION_STEPS:
+        print(f"[{name}] {instruction}，然后按 F2。")
+        winsound.Beep(750, 120)
+        if not wait_key_edge(VK["F2"]):
+            print("已取消背包装备校准；此前记录尚未写入文件。")
+            return
+        sx, sy = win32api.GetCursorPos()
+        cx, cy = win32gui.ScreenToClient(window.hwnd, (sx, sy))
+        if not (0 <= cx < w and 0 <= cy < h):
+            raise RuntimeError(f"记录点 ({cx}, {cy}) 不在游戏客户区内，请重新运行校准。")
+        profile[name] = window.client_to_normalized((cx, cy))
+        print(f"  已记录客户区坐标 ({cx}, {cy})，归一化 {profile[name]}\n")
+    save_inventory_profile(profile)
+    winsound.Beep(1000, 250)
+    print(f"背包装备校准完成，个人坐标已保存到 {INVENTORY_PROFILE_PATH}")
 
 
 def ocr_test(cfg: dict) -> None:
@@ -1548,14 +2208,154 @@ def focus_pulse_test(cfg: dict) -> None:
     print("焦点脉冲冒烟测试通过。")
 
 
+def inventory_detection_test(cfg: dict) -> None:
+    """只验证背包/商店和图标定位，不换装、不拖拽、不出售。"""
+    bot = Bot(cfg, live=True, mode="full")
+    bot.running = True
+    required = (
+        "inventory_grid_top_left",
+        "inventory_grid_bottom_right",
+        "shop_button",
+    )
+    missing = [name for name in required if not bot.inventory_profile.get(name)]
+    if missing:
+        raise RuntimeError(
+            "背包检测测试前请先运行“校准背包装备.bat”；缺少："
+            + ", ".join(missing)
+        )
+    action_cfg = cfg.get("inventory_automation", {})
+    panel_threshold = float(action_cfg.get("panel_match_threshold", 0.85))
+    weapon_threshold = float(action_cfg.get("weapon_match_threshold", 0.78))
+    medicine_threshold = float(action_cfg.get("medicine_match_threshold", 0.76))
+    try:
+        if not bot.open_inventory_checked():
+            raise RuntimeError("未能打开并确认背包界面。")
+        weapon_name, weapon_point, weapon_score = bot.find_inventory_icon(
+            bot.weapon_variant_templates
+        )
+        medicine_name, medicine_point, medicine_score = bot.find_inventory_icon(
+            {"medicine": bot.medicine_item_template}
+        )
+        print(
+            f"武器识别：{weapon_name}，分数 {weapon_score:.3f}，位置 {weapon_point}"
+        )
+        if weapon_point is None or weapon_score < weapon_threshold:
+            raise RuntimeError("没有可靠识别到换武器图标。")
+        if medicine_point is None or medicine_score < medicine_threshold:
+            print(f"药品识别：当前背包中未找到目标药品（分数 {medicine_score:.3f}），这是允许的。")
+        else:
+            print(
+                f"药品识别：{medicine_name}，分数 {medicine_score:.3f}，位置 {medicine_point}"
+            )
+
+        bot.window.click_normalized(bot.inventory_profile["shop_button"], live=True)
+        bot.wait(float(action_cfg.get("shop_open_seconds", 1.0)))
+        shop_visible, shop_score = bot.ui_template_visible(
+            bot.shop_template, panel_threshold
+        )
+        print(f"杂货铺识别：{shop_visible}，分数 {shop_score:.3f}")
+        if not shop_visible:
+            raise RuntimeError("未能打开并确认杂货铺界面。")
+        print("背包识别测试通过；没有换武器、拖拽物品或执行出售。")
+    finally:
+        bot.close_optional_panels()
+
+
+def merge_config_overrides(target: dict, overrides: dict) -> None:
+    """递归合并测试参数；以下划线开头的说明字段仅供人阅读。"""
+    for key, value in overrides.items():
+        if str(key).startswith("_"):
+            continue
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            merge_config_overrides(target[key], value)
+        else:
+            target[key] = deepcopy(value)
+
+
+def full_chain_smoke_test(cfg: dict, cycles: int = 2) -> None:
+    """从独立 JSON 载入快速阈值并真实跑完整闭环；不覆盖正式配置。"""
+    if not SMOKE_CONFIG_PATH.exists():
+        raise FileNotFoundError(f"找不到冒烟测试参数：{SMOKE_CONFIG_PATH}")
+    with SMOKE_CONFIG_PATH.open("r", encoding="utf-8") as f:
+        smoke_cfg = json.load(f)
+
+    smoke_meta = smoke_cfg.get("smoke_test", {})
+    minimum_cycles = max(2, int(smoke_meta.get("minimum_cycles", 2)))
+    cycles = max(minimum_cycles, int(cycles))
+    test_cfg = deepcopy(cfg)
+    merge_config_overrides(
+        test_cfg,
+        {key: value for key, value in smoke_cfg.items() if key != "smoke_test"},
+    )
+
+    print(
+        f"快速完整链路测试：{cycles} 轮；每轮只要求 1 次副本，"
+        f"Q/W 测试间隔为 {test_cfg['combat']['skill_q_interval_seconds']}/"
+        f"{test_cfg['combat']['skill_w_interval_seconds']} 秒。"
+    )
+    print(
+        f"测试参数来自 {SMOKE_CONFIG_PATH.name}，仅存在于本次进程；"
+        "config.json 保持正式参数不变。"
+    )
+    bot = Bot(test_cfg, live=True, mode="full")
+    bot.running = True
+    try:
+        for cycle_index in range(1, cycles + 1):
+            logging.info("========== 完整链路冒烟测试第 %s/%s 轮 =========", cycle_index, cycles)
+            bot.normal_farm_until_low()
+            if bot.stopped:
+                raise RuntimeError(f"第 {cycle_index} 轮普通挂机阶段被停止。")
+            bot.boss_recovery_loop()
+            if bot.stopped:
+                raise RuntimeError(f"第 {cycle_index} 轮 BOSS 恢复阶段被停止。")
+            logging.info("完整链路冒烟测试第 %s/%s 轮完成。", cycle_index, cycles)
+    finally:
+        bot.window.release_keys(("A", "SPACE", "Q", "W"), live=True)
+
+    expected_keys = {
+        str(test_cfg["combat"]["attack_key"]).upper(),
+        str(test_cfg["combat"]["pickup_key"]).upper(),
+        str(test_cfg["combat"]["skill_q_key"]).upper(),
+        str(test_cfg["combat"]["skill_w_key"]).upper(),
+    }
+    missing_keys = sorted(
+        key for key in expected_keys if bot.combat_input_counts.get(key, 0) <= 0
+    )
+    print(f"两轮战斗按键计数：{dict(bot.combat_input_counts)}")
+    if missing_keys:
+        raise RuntimeError("完整链路虽然结束，但这些战斗按键没有被覆盖：" + ", ".join(missing_keys))
+    print(f"完整链路 {cycles} 轮冒烟测试通过。")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Curious Beast 外部挂机 MVP")
     parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     parser.add_argument("--calibrate", action="store_true", help="运行一次性坐标校准")
     parser.add_argument("--calibrate-map", action="store_true", help="只重新校准右上角小地图")
+    parser.add_argument(
+        "--calibrate-inventory",
+        action="store_true",
+        help="单独校准换武器、药品拖拽和杂货铺坐标",
+    )
     parser.add_argument("--ocr-test", action="store_true", help="只测试疲劳 OCR")
     parser.add_argument(
         "--focus-test", action="store_true", help="测试被遮挡截图、焦点脉冲和 OCR"
+    )
+    parser.add_argument(
+        "--inventory-test",
+        action="store_true",
+        help="无损测试背包、杂货铺、武器和药品图标识别",
+    )
+    parser.add_argument(
+        "--full-smoke-test",
+        action="store_true",
+        help="用临时快速阈值真实执行至少两轮完整疲劳闭环",
+    )
+    parser.add_argument(
+        "--smoke-cycles",
+        type=int,
+        default=2,
+        help="完整闭环冒烟测试轮数，最小为 2",
     )
     parser.add_argument("--live", action="store_true", help="允许真实发送输入；否则为演练模式")
     parser.add_argument(
@@ -1580,11 +2380,22 @@ def main() -> int:
     if args.calibrate_map:
         calibrate_map_button(cfg)
         return 0
+    if args.calibrate_inventory:
+        calibrate_inventory(cfg)
+        return 0
     if args.ocr_test:
         ocr_test(cfg)
         return 0
     if args.focus_test:
         focus_pulse_test(cfg)
+        return 0
+    if args.inventory_test:
+        inventory_detection_test(cfg)
+        return 0
+    if args.full_smoke_test:
+        if not args.live:
+            raise RuntimeError("完整链路冒烟测试会真实控制游戏，必须同时传入 --live。")
+        full_chain_smoke_test(cfg, cycles=args.smoke_cycles)
         return 0
     instance_mutex = win32event.CreateMutex(None, False, "Local\\CuriousBeastAutomationMVP")
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
