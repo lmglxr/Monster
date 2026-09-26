@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import contextmanager
 import ctypes
 import json
 import logging
@@ -12,7 +13,7 @@ import sys
 import time
 import warnings
 import winsound
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -24,6 +25,7 @@ import win32con
 import win32event
 import win32gui
 import win32process
+import win32ui
 import winerror
 
 
@@ -32,6 +34,7 @@ CONFIG_PATH = APP_DIR / "config.json"
 ASSET_DIR = APP_DIR / "assets"
 RUNTIME_LOG = APP_DIR / "runtime.log"
 DEBUG_DIR = APP_DIR / "debug"
+APP_VERSION = "0.0.2"
 
 VK = {
     "A": 0x41,
@@ -101,6 +104,20 @@ class GameWindow:
     capture_retries: int = 5
     capture_retry_seconds: float = 0.5
     reconnect_epoch: int = 0
+    input_mode: str = "foreground_only"
+    focus_settle_seconds: float = 0.08
+    post_input_seconds: float = 0.12
+    restore_previous_window: bool = True
+    capture_mode: str = "screen"
+    _input_session_depth: int = field(default=0, init=False, repr=False)
+    _previous_foreground: int = field(default=0, init=False, repr=False)
+    _previous_cursor: Optional[tuple[int, int]] = field(
+        default=None, init=False, repr=False
+    )
+    _last_bot_cursor: Optional[tuple[int, int]] = field(
+        default=None, init=False, repr=False
+    )
+    _focus_notice_logged: bool = field(default=False, init=False, repr=False)
 
     def locate(self, attempts: Optional[int] = None) -> None:
         attempts = max(1, int(attempts or self.reconnect_attempts))
@@ -187,19 +204,141 @@ class GameWindow:
         if not self.is_foreground():
             raise RuntimeError("游戏不在前台，已暂停发送输入。切回游戏后按 F8 继续。")
 
+    @property
+    def supports_focus_pulse(self) -> bool:
+        return self.input_mode == "focus_pulse"
+
+    @staticmethod
+    def _activate_window(hwnd: int) -> None:
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            return
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        foreground = win32gui.GetForegroundWindow()
+        current_thread = kernel32.GetCurrentThreadId()
+        foreground_thread = user32.GetWindowThreadProcessId(foreground, None)
+        attached = bool(
+            foreground_thread
+            and foreground_thread != current_thread
+            and user32.AttachThreadInput(current_thread, foreground_thread, True)
+        )
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.BringWindowToTop(hwnd)
+            win32gui.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                user32.AttachThreadInput(current_thread, foreground_thread, False)
+
+    @contextmanager
+    def input_session(self, live: bool = True):
+        """Temporarily focus the game and restore the user's window/cursor."""
+        if not live:
+            yield
+            return
+        if self.input_mode == "foreground_only":
+            self.require_foreground()
+            yield
+            return
+        if self.input_mode != "focus_pulse":
+            raise RuntimeError(f"不支持的 input_mode：{self.input_mode}")
+        if self._input_session_depth:
+            self._input_session_depth += 1
+            try:
+                yield
+            finally:
+                self._input_session_depth -= 1
+            return
+
+        self.ensure()
+        self._input_session_depth = 1
+        self._previous_foreground = win32gui.GetForegroundWindow()
+        self._previous_cursor = win32api.GetCursorPos()
+        self._last_bot_cursor = None
+        if self._previous_foreground != self.hwnd:
+            self._activate_window(self.hwnd)
+            time.sleep(max(0.0, self.focus_settle_seconds))
+        if win32gui.GetForegroundWindow() != self.hwnd:
+            self._input_session_depth = 0
+            raise RuntimeError("无法临时切换到游戏窗口，已取消本次输入以避免误操作。")
+        if not self._focus_notice_logged:
+            logging.warning(
+                "焦点脉冲模式已启用：发送输入时会短暂切到游戏，随后恢复原窗口和鼠标。"
+            )
+            self._focus_notice_logged = True
+        try:
+            yield
+        finally:
+            # 只有光标仍停在脚本最后设置的位置时才恢复；如果用户在脉冲期间
+            # 主动移动了鼠标，保留用户的新位置，避免反向抢鼠标。
+            if (
+                self._previous_cursor is not None
+                and self._last_bot_cursor is not None
+                and win32api.GetCursorPos() == self._last_bot_cursor
+            ):
+                win32api.SetCursorPos(self._previous_cursor)
+            # 用户若已主动切到第三个窗口，则不再强行恢复旧窗口。
+            if (
+                self.restore_previous_window
+                and win32gui.GetForegroundWindow() == self.hwnd
+                and self._previous_foreground != self.hwnd
+                and win32gui.IsWindow(self._previous_foreground)
+            ):
+                self._activate_window(self._previous_foreground)
+            self._input_session_depth = 0
+            self._previous_foreground = 0
+            self._previous_cursor = None
+            self._last_bot_cursor = None
+
+    def _capture_print_window(self) -> np.ndarray:
+        self.ensure()
+        if win32gui.IsIconic(self.hwnd):
+            raise RuntimeError("游戏窗口已最小化；焦点脉冲模式允许遮挡，但不能最小化游戏。")
+        width, height = self.client_size()
+        if width <= 0 or height <= 0:
+            raise RuntimeError(f"游戏客户区尺寸无效：{width}x{height}")
+        window_dc = win32gui.GetWindowDC(self.hwnd)
+        source_dc = win32ui.CreateDCFromHandle(window_dc)
+        memory_dc = source_dc.CreateCompatibleDC()
+        bitmap = win32ui.CreateBitmap()
+        try:
+            bitmap.CreateCompatibleBitmap(source_dc, width, height)
+            memory_dc.SelectObject(bitmap)
+            # PW_CLIENTONLY | PW_RENDERFULLCONTENT。该游戏实测可在被遮挡时返回
+            # 完整客户区，而不是桌面上覆盖它的其他窗口。
+            if not ctypes.windll.user32.PrintWindow(
+                self.hwnd, memory_dc.GetSafeHdc(), 3
+            ):
+                raise RuntimeError("PrintWindow 未返回游戏画面")
+            info = bitmap.GetInfo()
+            frame = np.frombuffer(bitmap.GetBitmapBits(True), dtype=np.uint8).reshape(
+                info["bmHeight"], info["bmWidth"], 4
+            )[:, :, :3].copy()
+            if frame.size == 0 or float(frame.std()) < 1.0:
+                raise RuntimeError("PrintWindow 返回空白画面")
+            return frame
+        finally:
+            memory_dc.DeleteDC()
+            source_dc.DeleteDC()
+            win32gui.ReleaseDC(self.hwnd, window_dc)
+            if bitmap.GetHandle():
+                win32gui.DeleteObject(bitmap.GetHandle())
+
     def capture(self) -> np.ndarray:
         last_error: Optional[Exception] = None
         retries = max(1, int(self.capture_retries))
         for attempt in range(1, retries + 1):
             try:
                 self.ensure()
+                if self.capture_mode == "print_window":
+                    return self._capture_print_window()
+                if self.capture_mode != "screen":
+                    raise RuntimeError(f"不支持的 capture_mode：{self.capture_mode}")
                 x, y = self.client_origin()
                 w, h = self.client_size()
                 if w <= 0 or h <= 0:
                     raise RuntimeError(f"游戏客户区尺寸无效：{w}x{h}")
-                image = ImageGrab.grab(
-                    bbox=(x, y, x + w, y + h), all_screens=True
-                )
+                image = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
                 pixels = np.asarray(image)
                 if pixels.size == 0:
                     raise RuntimeError("游戏窗口截图为空")
@@ -235,18 +374,23 @@ class GameWindow:
         if not live:
             logging.info("DRY move (%s, %s)", x, y)
             return
-        self.require_foreground()
-        ox, oy = self.client_origin()
-        win32api.SetCursorPos((ox + x, oy + y))
+        with self.input_session(live=True):
+            ox, oy = self.client_origin()
+            target = (ox + x, oy + y)
+            win32api.SetCursorPos(target)
+            self._last_bot_cursor = target
 
     def click_client(self, x: int, y: int, live: bool = True) -> None:
         if not live:
             logging.info("DRY click (%s, %s)", x, y)
             return
-        self.move_client(x, y, live=True)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        time.sleep(0.05)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        with self.input_session(live=True):
+            self.move_client(x, y, live=True)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            time.sleep(0.05)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            if self.supports_focus_pulse:
+                time.sleep(max(0.0, self.post_input_seconds))
 
     def click_normalized(self, point: list[float], live: bool = True) -> None:
         self.click_client(*self.normalized_to_client(point), live=live)
@@ -256,25 +400,24 @@ class GameWindow:
         if not live:
             logging.info("DRY key %s hold %.2fs", name, hold_seconds)
             return
-        self.require_foreground()
-        win32api.keybd_event(vk, 0, 0, 0)
-        time.sleep(hold_seconds)
-        win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
+        with self.input_session(live=True):
+            win32api.keybd_event(vk, 0, 0, 0)
+            time.sleep(hold_seconds)
+            win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
+            if self.supports_focus_pulse:
+                time.sleep(max(0.0, self.post_input_seconds))
 
     def release_keys(self, names: tuple[str, ...], live: bool = True) -> None:
         if not live:
             logging.info("DRY release keys %s", ", ".join(names))
             return
-        # 释放按键不能因窗口暂时消失而阻塞 F12 停止流程；句柄无效或不在
-        # 前台时直接跳过，避免把全局 KEYUP 发送给其他程序。
-        if (
-            not self.hwnd
-            or not win32gui.IsWindow(self.hwnd)
-            or win32gui.GetForegroundWindow() != self.hwnd
-        ):
+        if not self.hwnd or not win32gui.IsWindow(self.hwnd):
             return
-        for name in names:
-            win32api.keybd_event(VK[name.upper()], 0, win32con.KEYEVENTF_KEYUP, 0)
+        if self.input_mode == "foreground_only" and not self.is_foreground():
+            return
+        with self.input_session(live=True):
+            for name in names:
+                win32api.keybd_event(VK[name.upper()], 0, win32con.KEYEVENTF_KEYUP, 0)
 
 
 class LogTail:
@@ -468,6 +611,7 @@ class Bot:
         self.live = live
         self.mode = mode
         recovery_cfg = cfg.get("recovery", {})
+        window_cfg = cfg.get("window_control", {})
         self.window = GameWindow(
             cfg["window_title"],
             reconnect_attempts=max(
@@ -480,6 +624,15 @@ class Bot:
             capture_retry_seconds=float(
                 recovery_cfg.get("capture_retry_seconds", 0.5)
             ),
+            input_mode=str(window_cfg.get("input_mode", "foreground_only")),
+            focus_settle_seconds=float(
+                window_cfg.get("focus_settle_seconds", 0.08)
+            ),
+            post_input_seconds=float(window_cfg.get("post_input_seconds", 0.12)),
+            restore_previous_window=bool(
+                window_cfg.get("restore_previous_window", True)
+            ),
+            capture_mode=str(window_cfg.get("capture_mode", "screen")),
         )
         self.window.locate()
         resolved_log_path = resolve_log_path(cfg.get("log_path", "auto"), self.window)
@@ -699,7 +852,10 @@ class Bot:
                         time.sleep(0.05)
                     deadline += time.monotonic() - pause_started
                     continue
-                if not self.window.is_foreground():
+                if (
+                    not self.window.supports_focus_pulse
+                    and not self.window.is_foreground()
+                ):
                     if not foreground_warned:
                         logging.warning("死亡等待中游戏失去前台；切回游戏后才会点击原地复活。")
                         foreground_warned = True
@@ -710,10 +866,12 @@ class Bot:
                     deadline += time.monotonic() - foreground_lost_at
                     continue
                 foreground_warned = False
-                # 鼠标保持在按钮上：按钮可用时会稳定显示为橙色。
-                self.window.move_client(
-                    *self.window.normalized_to_client(point), live=self.live
-                )
+                # 前台专用模式沿用悬停检测；焦点脉冲模式在按钮真正可用后
+                # 才短暂切前台点击，避免死亡等待期间每 0.2 秒抢焦点。
+                if not self.window.supports_focus_pulse:
+                    self.window.move_client(
+                        *self.window.normalized_to_client(point), live=self.live
+                    )
                 frame = self.capture_frame()
                 visible, panel_score = self.revive_panel_visible(frame)
                 if not visible:
@@ -751,7 +909,10 @@ class Bot:
             if wait_round < wait_rounds:
                 self.window.release_keys(("A", "SPACE"), live=self.live)
                 retry_point = revive_cfg.get("retry_move_point", [0.5, 0.5])
-                if self.window.is_foreground():
+                if (
+                    self.window.supports_focus_pulse
+                    or self.window.is_foreground()
+                ):
                     self.window.move_client(
                         *self.window.normalized_to_client(retry_point), live=self.live
                     )
@@ -904,35 +1065,41 @@ class Bot:
             self._confirm_reconnected_window()
             revive_epoch = self.revive_epoch
 
-            # 每一轮都先移出再移回，强制游戏丢弃旧提示框并生成最新数值。
-            self.window.move_client(*refresh, live=self.live)
-            if not self.wait(float(fatigue_cfg.get("refresh_leave_seconds", 0.25))):
-                return None
-            if self.revive_epoch != revive_epoch:
-                return self.read_fatigue(
-                    attempts=attempts, refresh_rounds=refresh_rounds
-                )
-            self.window.move_client(*hover, live=self.live)
-            if not self.wait(float(fatigue_cfg.get("hover_settle_seconds", 0.8))):
-                return None
-            if self.revive_epoch != revive_epoch:
-                return self.read_fatigue(
-                    attempts=attempts, refresh_rounds=refresh_rounds
-                )
-
-            values: list[int] = []
-            for _ in range(attempts):
-                frame = self.capture_frame()
-                value, texts = self.ocr.read(
-                    frame,
-                    fatigue_cfg["ocr_region"],
-                    fatigue_cfg.get("value_region"),
-                )
-                logging.info("疲劳 OCR: value=%s raw=%s", value, texts)
-                if value is not None and -1000 <= value <= 1000:
-                    values.append(value)
-                if not self.wait(0.25):
+            # 疲劳提示依赖真实鼠标。焦点脉冲模式将整次“移出、移回、
+            # OCR”放在同一个短会话中，识别完成后一次性恢复用户窗口。
+            with self.window.input_session(live=self.live):
+                self.window.move_client(*refresh, live=self.live)
+                if not self.wait(
+                    float(fatigue_cfg.get("refresh_leave_seconds", 0.25))
+                ):
                     return None
+                if self.revive_epoch != revive_epoch:
+                    return self.read_fatigue(
+                        attempts=attempts, refresh_rounds=refresh_rounds
+                    )
+                self.window.move_client(*hover, live=self.live)
+                if not self.wait(
+                    float(fatigue_cfg.get("hover_settle_seconds", 0.8))
+                ):
+                    return None
+                if self.revive_epoch != revive_epoch:
+                    return self.read_fatigue(
+                        attempts=attempts, refresh_rounds=refresh_rounds
+                    )
+
+                values: list[int] = []
+                for _ in range(attempts):
+                    frame = self.capture_frame()
+                    value, texts = self.ocr.read(
+                        frame,
+                        fatigue_cfg["ocr_region"],
+                        fatigue_cfg.get("value_region"),
+                    )
+                    logging.info("疲劳 OCR: value=%s raw=%s", value, texts)
+                    if value is not None and -1000 <= value <= 1000:
+                        values.append(value)
+                    if not self.wait(0.25):
+                        return None
             if values:
                 values.sort()
                 value = values[len(values) // 2]
@@ -965,7 +1132,10 @@ class Bot:
             if not self.running:
                 time.sleep(0.05)
                 continue
-            if not self.window.is_foreground():
+            if (
+                not self.window.supports_focus_pulse
+                and not self.window.is_foreground()
+            ):
                 logging.warning("游戏失去前台，挂机暂停；切回游戏后继续。")
                 while not self.window.is_foreground() and not self.stopped:
                     self.check_control_keys()
@@ -1149,8 +1319,19 @@ class Bot:
         if missing:
             raise RuntimeError(f"尚未校准这些坐标：{', '.join(missing)}")
         w, h = self.window.client_size()
-        logging.info("已连接游戏窗口，客户区 %sx%s，live=%s", w, h, self.live)
-        print("准备完成。请切到游戏窗口，按 F8 开始/暂停，按 F12 立即停止。")
+        logging.info(
+            "已连接游戏窗口，客户区 %sx%s，live=%s，input_mode=%s，capture_mode=%s",
+            w,
+            h,
+            self.live,
+            self.window.input_mode,
+            self.window.capture_mode,
+        )
+        if self.window.supports_focus_pulse:
+            print("准备完成。可停留在其他窗口，按 F8 开始/暂停，按 F12 立即停止。")
+            print("输入时会短暂切到游戏并自动恢复；连续战斗期间可能影响正在进行的打字。")
+        else:
+            print("准备完成。请切到游戏窗口，按 F8 开始/暂停，按 F12 立即停止。")
         mode_text = "完整闭环" if self.mode == "full" else "只刷副本"
         print("当前模式：" + mode_text + " / " + ("实时输入" if self.live else "演练（不发送输入）"))
         while not self.stopped:
@@ -1258,11 +1439,124 @@ def ocr_test(cfg: dict) -> None:
     print(f"识别结果：{value}/1000；原始OCR：{texts}")
 
 
+def focus_pulse_test(cfg: dict) -> None:
+    """Safe smoke test for background capture, focus restoration, map click and OCR."""
+    recovery_cfg = cfg.get("recovery", {})
+    window_cfg = cfg.get("window_control", {})
+    window = GameWindow(
+        cfg["window_title"],
+        reconnect_attempts=max(
+            1, int(recovery_cfg.get("window_reconnect_attempts", 5))
+        ),
+        reconnect_interval_seconds=float(
+            recovery_cfg.get("window_reconnect_interval_seconds", 2.0)
+        ),
+        capture_retries=max(1, int(recovery_cfg.get("capture_retries", 5))),
+        capture_retry_seconds=float(
+            recovery_cfg.get("capture_retry_seconds", 0.5)
+        ),
+        input_mode="focus_pulse",
+        capture_mode="print_window",
+        focus_settle_seconds=float(window_cfg.get("focus_settle_seconds", 0.08)),
+        post_input_seconds=float(window_cfg.get("post_input_seconds", 0.12)),
+        restore_previous_window=True,
+    )
+    window.locate()
+    if win32gui.IsIconic(window.hwnd):
+        raise RuntimeError("请先还原游戏窗口；可以遮挡，但不能最小化。")
+
+    previous_window = win32gui.GetForegroundWindow()
+    previous_cursor = win32api.GetCursorPos()
+    template = cv2.imread(str(ASSET_DIR / "map_open_indicator.png"), cv2.IMREAD_GRAYSCALE)
+    if template is None:
+        raise RuntimeError("缺少地图检测模板 assets/map_open_indicator.png")
+
+    def map_score() -> float:
+        frame = window.capture()
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        reference_width = float(cfg.get("reference_client_size", [1280, 720])[0])
+        scale = gray.shape[1] / reference_width
+        resized = cv2.resize(
+            template,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC,
+        )
+        return float(
+            cv2.minMaxLoc(
+                cv2.matchTemplate(gray, resized, cv2.TM_CCOEFF_NORMED)
+            )[1]
+        )
+
+    threshold = float(cfg["map_detection"]["open_match_threshold"])
+    if map_score() >= threshold:
+        window.tap_key("ESC", live=True)
+        time.sleep(0.6)
+    closed_score = map_score()
+    if closed_score >= threshold:
+        raise RuntimeError("测试前无法关闭地图，请回到普通 HUD 后重试。")
+
+    started = time.perf_counter()
+    window.click_normalized(cfg["coordinates"]["map_button"], live=True)
+    pulse_ms = (time.perf_counter() - started) * 1000
+    time.sleep(0.7)
+    opened_score = map_score()
+    if opened_score < threshold:
+        raise RuntimeError(
+            f"焦点脉冲点击未能打开地图（匹配分数 {opened_score:.3f}）。"
+        )
+    window.tap_key("ESC", live=True)
+    time.sleep(0.6)
+    final_score = map_score()
+    if final_score >= threshold:
+        raise RuntimeError("地图已打开，但焦点脉冲 ESC 未能将其关闭。")
+
+    reader = FatigueOCR(cfg.get("debug"))
+    fatigue_cfg = cfg["fatigue"]
+    with window.input_session(live=True):
+        window.move_client(
+            *window.normalized_to_client(
+                fatigue_cfg.get("refresh_point", [0.5, 0.5])
+            ),
+            live=True,
+        )
+        time.sleep(float(fatigue_cfg.get("refresh_leave_seconds", 0.25)))
+        window.move_client(
+            *window.normalized_to_client(fatigue_cfg["hover_point"]), live=True
+        )
+        time.sleep(float(fatigue_cfg.get("hover_settle_seconds", 0.8)))
+        fatigue, texts = reader.read(
+            window.capture(),
+            fatigue_cfg["ocr_region"],
+            fatigue_cfg.get("value_region"),
+        )
+
+    focus_restored = win32gui.GetForegroundWindow() == previous_window
+    cursor_restored = win32api.GetCursorPos() == previous_cursor
+    print(
+        f"地图测试：关闭 {closed_score:.3f} -> 打开 {opened_score:.3f} -> "
+        f"关闭 {final_score:.3f}；点击脉冲 {pulse_ms:.0f} ms"
+    )
+    print(f"疲劳 OCR：{fatigue}；原始结果：{texts}")
+    print(
+        f"窗口恢复：{focus_restored}；鼠标回到测试前位置：{cursor_restored}"
+        "（测试期间若主动移动鼠标，程序会保留用户的新位置）"
+    )
+    if fatigue is None or not focus_restored:
+        raise RuntimeError("焦点脉冲测试未完全通过，请查看以上结果。")
+    print("焦点脉冲冒烟测试通过。")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Curious Beast 外部挂机 MVP")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     parser.add_argument("--calibrate", action="store_true", help="运行一次性坐标校准")
     parser.add_argument("--calibrate-map", action="store_true", help="只重新校准右上角小地图")
     parser.add_argument("--ocr-test", action="store_true", help="只测试疲劳 OCR")
+    parser.add_argument(
+        "--focus-test", action="store_true", help="测试被遮挡截图、焦点脉冲和 OCR"
+    )
     parser.add_argument("--live", action="store_true", help="允许真实发送输入；否则为演练模式")
     parser.add_argument(
         "--mode",
@@ -1288,6 +1582,9 @@ def main() -> int:
         return 0
     if args.ocr_test:
         ocr_test(cfg)
+        return 0
+    if args.focus_test:
+        focus_pulse_test(cfg)
         return 0
     instance_mutex = win32event.CreateMutex(None, False, "Local\\CuriousBeastAutomationMVP")
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:

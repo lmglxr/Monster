@@ -7,6 +7,19 @@
     720
   ],
   "_reference_client_size_comment": "录制模板和入口绕圈半径时使用的客户区基准尺寸，格式为 [宽, 高]，单位为像素。普通坐标已归一化，通常不需要随分辨率修改此项。",
+  "window_control": {
+    "_comment": "v0.0.2 窗口捕获和输入策略。焦点脉冲不是完全无感的真后台输入：每次按键或点击会短暂把游戏切到前台，完成后恢复原窗口与鼠标；游戏可被其他窗口遮挡，但不要最小化、锁屏或让电脑睡眠。",
+    "input_mode": "focus_pulse",
+    "_input_mode_comment": "输入模式。focus_pulse=需要输入时短暂切到游戏并恢复，允许平时使用其他窗口；foreground_only=旧版行为，游戏不在前台时暂停输入。连续战斗会频繁产生很短的焦点切换，可能影响同时打字。",
+    "capture_mode": "print_window",
+    "_capture_mode_comment": "截图模式。print_window=直接捕获游戏客户区，实测被其他窗口遮挡时仍可 OCR 和模板识别；screen=旧版桌面区域截图，被遮挡时会截到其他窗口。",
+    "focus_settle_seconds": 0.08,
+    "_focus_settle_seconds_comment": "每次临时切到游戏后、真正发送按键或鼠标前的稳定等待时间，单位为秒。过短可能丢输入，过长会让焦点切换更明显。",
+    "post_input_seconds": 0.12,
+    "_post_input_seconds_comment": "鼠标抬起或按键释放后，继续保持游戏前台供 Unity 消费本次输入的时间，单位为秒。过短可能使指令延迟到下一次焦点脉冲才执行。",
+    "restore_previous_window": true,
+    "_restore_previous_window_comment": "输入结束后是否恢复原来的前台窗口。若脉冲期间用户已经主动切到第三个窗口，程序不会覆盖用户的新选择。"
+  },
   "fatigue": {
     "_comment": "疲劳值检测与模式切换参数。游戏疲劳显示范围按 -1000～1000 处理。",
     "low_threshold": -800,
