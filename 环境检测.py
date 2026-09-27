@@ -127,10 +127,11 @@ def check_frida_attach(check_game: bool) -> bool:
     try:
         import frida
 
+        device = frida.get_local_device()
         process = next(
             (
                 item
-                for item in frida.enumerate_processes()
+                for item in device.enumerate_processes()
                 if item.name.lower() in {"creaturecurios", "creaturecurios.exe"}
             ),
             None,
@@ -139,7 +140,7 @@ def check_frida_attach(check_game: bool) -> bool:
             print("[失败] 未找到 CreatureCurios.exe，请先启动游戏并进入角色画面。")
             return False
 
-        session = frida.attach(process.pid)
+        session = device.attach(process.pid)
         try:
             modules = session.enumerate_modules()
             mono_found = any(

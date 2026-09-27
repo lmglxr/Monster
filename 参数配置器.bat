@@ -1,0 +1,4 @@
+@echo off
+chcp 65001 >nul
+cd /d "%~dp0"
+call "%~dp0_运行Python.bat" "%~dp0参数配置器.py"
