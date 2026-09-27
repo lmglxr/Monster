@@ -41,7 +41,7 @@ ASSET_DIR = APP_DIR / "assets"
 RUNTIME_LOG = APP_DIR / "runtime.log"
 MONO_PROBE_SCRIPT = APP_DIR / "mono_runtime_probe.js"
 DEBUG_DIR = APP_DIR / "debug"
-APP_VERSION = "0.0.3"
+APP_VERSION = "0.0.2"
 
 VK = {
     "A": 0x41,
@@ -90,14 +90,13 @@ def save_config(cfg: dict) -> None:
 
 
 def load_inventory_profile() -> dict:
-    """加载每位玩家单独校准的背包坐标；缺失时安全返回空配置。"""
-    if not INVENTORY_PROFILE_PATH.exists():
-        return {}
+    """优先加载个人配置；缺失时继承仓库提供的默认背包参数。"""
+    path = INVENTORY_PROFILE_PATH if INVENTORY_PROFILE_PATH.exists() else INVENTORY_PROFILE_EXAMPLE_PATH
     try:
-        with INVENTORY_PROFILE_PATH.open("r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8") as f:
             return json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        logging.warning("个人背包坐标文件读取失败，将禁用本轮背包自动化：%s", exc)
+        logging.warning("背包参数文件读取失败，将禁用本轮背包自动化：%s", exc)
         return {}
 
 
