@@ -41,7 +41,7 @@ ASSET_DIR = APP_DIR / "assets"
 RUNTIME_LOG = APP_DIR / "runtime.log"
 MONO_PROBE_SCRIPT = APP_DIR / "mono_runtime_probe.js"
 DEBUG_DIR = APP_DIR / "debug"
-APP_VERSION = "0.0.2"
+APP_VERSION = "0.0.3"
 
 VK = {
     "A": 0x41,

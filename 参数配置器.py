@@ -65,7 +65,7 @@ def set_value(data: dict, path: tuple[str, ...], value) -> None:
 class ConfigEditor(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Curious Beast 参数配置器 v0.0.2")
+        self.title("Curious Beast 参数配置器 v0.0.3")
         self.geometry("720x760")
         self.minsize(650, 620)
         self.config_data: dict = {}
