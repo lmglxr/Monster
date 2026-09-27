@@ -11,6 +11,18 @@ REQUIREMENTS = APP_DIR / "requirements.txt"
 OCR_REQUIREMENTS = APP_DIR / "requirements-ocr.txt"
 
 
+def repair_pywin32() -> bool:
+    postinstall = Path(sys.executable).parent / "pywin32_postinstall.py"
+    if not postinstall.is_file():
+        return True
+    result = subprocess.run(
+        [sys.executable, str(postinstall), "-install"],
+        cwd=APP_DIR,
+        check=False,
+    )
+    return result.returncode == 0
+
+
 def sources() -> list[str]:
     configured = os.environ.get("CURIOUS_BEAST_PIP_INDEX", "").strip()
     candidates = [
@@ -66,6 +78,9 @@ def main() -> int:
             continue
         if install_ocr and not run_pip(index_url, OCR_REQUIREMENTS, "install"):
             print(f"当前源安装 OCR 依赖失败，将切换下一个源：{index_url}")
+            continue
+        if not repair_pywin32():
+            print("pywin32 后处理失败，将切换下一个源重试。")
             continue
         print(f"依赖安装完成，使用源：{index_url}")
         return 0

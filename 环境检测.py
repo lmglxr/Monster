@@ -5,6 +5,7 @@ import importlib
 import json
 import subprocess
 import sys
+import threading
 from importlib import metadata
 from pathlib import Path
 
@@ -136,10 +137,23 @@ def check_frida_attach(check_game: bool) -> bool:
 
         session = device.attach(process.pid)
         try:
-            modules = session.enumerate_modules()
-            mono_found = any(
-                module.name.lower() == "mono-2.0-bdwgc.dll" for module in modules
+            result = {"mono_found": False}
+            ready = threading.Event()
+
+            def on_message(message: dict, _data) -> None:
+                if message.get("type") == "send":
+                    result["mono_found"] = bool(message.get("payload"))
+                    ready.set()
+
+            script = session.create_script(
+                "send(Process.enumerateModulesSync().some(" \
+                "m => m.name.toLowerCase() === 'mono-2.0-bdwgc.dll'));"
             )
+            script.on("message", on_message)
+            script.load()
+            ready.wait(timeout=3.0)
+            script.unload()
+            mono_found = result["mono_found"]
         finally:
             session.detach()
 
