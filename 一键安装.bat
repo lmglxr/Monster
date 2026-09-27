@@ -32,9 +32,7 @@ if errorlevel 1 goto install_failed
 
 :install_packages
 echo Installing or checking packages. The first run may take several minutes...
-"%~dp0.venv\Scripts\python.exe" -m pip install --disable-pip-version-check --index-url https://pypi.org/simple --upgrade pip
-if errorlevel 1 goto install_failed
-"%~dp0.venv\Scripts\python.exe" -m pip install --disable-pip-version-check --index-url https://pypi.org/simple -r requirements.txt
+"%~dp0.venv\Scripts\python.exe" "%~dp0安装依赖.py"
 if errorlevel 1 goto install_failed
 
 echo.
