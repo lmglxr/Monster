@@ -146,7 +146,7 @@ def check_frida_attach(check_game: bool) -> bool:
                     ready.set()
 
             script = session.create_script(
-                "send(Process.enumerateModulesSync().some(" \
+                "send(Process.enumerateModules().some(" \
                 "m => m.name.toLowerCase() === 'mono-2.0-bdwgc.dll'));"
             )
             script.on("message", on_message)
