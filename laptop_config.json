@@ -21,7 +21,7 @@
     "boss_fatigue_probe_initial_delay_seconds": 20.0,
     "boss_fatigue_probe_interval_seconds": 10.0
   },
-  "dungeon_mount": {
+  "travel_mount": {
     "settle_seconds": 1.5
   },
   "inventory_automation": {
@@ -41,6 +41,7 @@
     "_comment": "地图展开、自动寻路、场景加载和退出均采用更保守的等待时间。",
     "map_open_seconds": 0.6,
     "normal_auto_path_seconds": 12.0,
+    "farm_auto_path_seconds": 20.0,
     "dungeon_load_seconds": 8.0,
     "boss_auto_path_seconds": 20.0,
     "boss_timeout_seconds": 210.0,

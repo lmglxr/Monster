@@ -29,6 +29,8 @@ import win32process
 import win32ui
 import winerror
 
+from mono_runtime_probe import MonoRuntimeProbe
+
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
@@ -37,6 +39,7 @@ INVENTORY_PROFILE_PATH = APP_DIR / "inventory_profile.json"
 INVENTORY_PROFILE_EXAMPLE_PATH = APP_DIR / "inventory_profile.example.json"
 ASSET_DIR = APP_DIR / "assets"
 RUNTIME_LOG = APP_DIR / "runtime.log"
+MONO_PROBE_SCRIPT = APP_DIR / "mono_runtime_probe.js"
 DEBUG_DIR = APP_DIR / "debug"
 APP_VERSION = "0.0.2"
 
@@ -44,6 +47,7 @@ VK = {
     "A": 0x41,
     "B": 0x42,
     "F": 0x46,
+    "M": 0x4D,
     "Q": 0x51,
     "W": 0x57,
     "SPACE": win32con.VK_SPACE,
@@ -227,6 +231,10 @@ class GameWindow:
             return Path(buffer.value).resolve()
         finally:
             win32api.CloseHandle(process)
+
+    def process_id(self) -> int:
+        self.ensure()
+        return int(win32process.GetWindowThreadProcessId(self.hwnd)[1])
 
     def require_foreground(self) -> None:
         if not self.is_foreground():
@@ -515,8 +523,9 @@ class GameWindow:
 
 
 class LogTail:
-    def __init__(self, path: str):
+    def __init__(self, path: str, boss_entity_id: int = 100043):
         self.path = Path(path)
+        self.boss_entity_id = int(boss_entity_id)
         self.position = 0
         self.latest_scene: Optional[int] = None
         self.scene_revision = 0
@@ -554,7 +563,7 @@ class LogTail:
             hp = int(match.group(4))
             life = match.group(5)
             self.latest_scene = scene
-            if target == 100043:
+            if target == self.boss_entity_id:
                 self.boss_seen = True
                 if hp == 0 or life == "LifeDead":
                     self.boss_dead = True
@@ -736,8 +745,24 @@ class Bot:
         )
         self.window.locate()
         resolved_log_path = resolve_log_path(cfg.get("log_path", "auto"), self.window)
-        self.log_tail = LogTail(str(resolved_log_path))
+        self.log_tail = LogTail(
+            str(resolved_log_path),
+            boss_entity_id=int(cfg.get("combat", {}).get("boss_entity_id", 100043)),
+        )
         self.log_tail.start_at_end()
+        self.runtime_probe: Optional[MonoRuntimeProbe] = None
+        combat_cfg = cfg.get("combat", {})
+        if (
+            str(combat_cfg.get("boss_death_detection_mode", "log_first")).lower()
+            == "runtime_first"
+            and bool(combat_cfg.get("runtime_probe_enabled", True))
+        ):
+            self.runtime_probe = MonoRuntimeProbe(
+                self.window.process_id(),
+                int(combat_cfg.get("boss_monster_id", 10005)),
+                MONO_PROBE_SCRIPT,
+            )
+            self.runtime_probe.start()
         # OCR 模型占用明显高于其余模块；延迟到完整闭环真正读取疲劳时再加载。
         self.ocr: Optional[FatigueOCR] = None
         self.portal_template = self._load_gray_template("portal.png")
@@ -749,8 +774,8 @@ class Bot:
         self.sell_quantity_template = self._load_gray_template("sell_quantity_title.png")
         self.medicine_item_template = self._load_gray_template("medicine_item_icon.png")
         self.weapon_variant_templates = {
-            "a": self._load_gray_template("weapon_variant_a_icon.png"),
-            "b": self._load_gray_template("weapon_variant_b_icon.png"),
+            "farm": self._load_gray_template("weapon_variant_a_icon.png"),
+            "boss": self._load_gray_template("weapon_variant_b_icon.png"),
         }
         self.inventory_profile = load_inventory_profile()
         self.running = False
@@ -762,7 +787,9 @@ class Bot:
         self._f8_down = False
         self._f12_down = False
         self._window_reconnect_epoch = self.window.reconnect_epoch
-        self._boss_weapon_active = False
+        # 完整流程按文档约定从刷怪 A 武器开始；一旦发出双击但未能复核，
+        # 状态会置为 None，下一次调用必须重新看背包，不能凭旧状态跳过。
+        self._boss_weapon_active: Optional[bool] = False
         self._inventory_missing_warned = False
         self.combat_input_counts: Counter[str] = Counter()
 
@@ -1171,9 +1198,18 @@ class Bot:
         return score >= threshold, score
 
     def find_inventory_icon(
-        self, templates: dict[str, Optional[np.ndarray]]
+        self,
+        templates: dict[str, Optional[np.ndarray]],
+        *,
+        near_point: Optional[list[float]] = None,
+        near_radius_cells: float = 0.7,
     ) -> tuple[Optional[str], Optional[list[float]], float]:
-        """在个人校准的背包网格内寻找图标，允许售卖后的物品自动重排。"""
+        """在背包网格内只返回所有候选模板中分数最高的一个图标。
+
+        默认搜索整个网格，以兼容售药后物品紧凑排列造成的行列变化。传入
+        ``near_point`` 时，仅在该实际格位附近复核，用于确认换装后同一格内的
+        A/B 武器图标确实发生了切换。
+        """
         top_left = self.inventory_profile.get("inventory_grid_top_left")
         bottom_right = self.inventory_profile.get("inventory_grid_bottom_right")
         if not top_left or not bottom_right:
@@ -1185,6 +1221,16 @@ class Bot:
         x2, y2 = int(bottom_right[0] * width), int(bottom_right[1] * height)
         x1, x2 = sorted((max(0, x1), min(width, x2)))
         y1, y2 = sorted((max(0, y1), min(height, y2)))
+        if near_point is not None:
+            grid_columns = max(
+                1, int(self.cfg.get("inventory_automation", {}).get("grid_columns", 5))
+            )
+            cell_width = max(1.0, (x2 - x1) / grid_columns)
+            radius = max(1, int(round(cell_width * near_radius_cells)))
+            point_x = int(near_point[0] * width)
+            point_y = int(near_point[1] * height)
+            x1, x2 = max(x1, point_x - radius), min(x2, point_x + radius)
+            y1, y2 = max(y1, point_y - radius), min(y2, point_y + radius)
         crop = gray[y1:y2, x1:x2]
         reference_width = float(self.cfg.get("reference_client_size", [1280, 720])[0])
         scale = width / reference_width
@@ -1315,10 +1361,11 @@ class Bot:
         return False
 
     def switch_weapon(self, target: str) -> bool:
-        """同一格双击可在两把主武器间切换；target 只用于维护流程状态。"""
+        """只搜索目标武器的最高分图标，并确认点击格切换成另一把武器。"""
         if target not in ("boss", "farm"):
             raise ValueError(f"未知武器目标：{target}")
         if (target == "boss") == self._boss_weapon_active:
+            logging.info("%s武器状态已确认，无需重复切换。", "BOSS" if target == "boss" else "刷怪")
             return True
         grid_keys = ("inventory_grid_top_left", "inventory_grid_bottom_right")
         if not self.inventory_actions_available(grid_keys):
@@ -1328,8 +1375,11 @@ class Bot:
             self.set_phase("inventory_weapon_switch")
             if not self.open_inventory_checked():
                 return False
+            # 两把武器会在被点击的格位互换。不能把两个模板的分数直接
+            # 比大小：清晰的 farm 模板会长期以 1.000 压过 boss，导致
+            # 到达 BOSS 后找错格。这里只在全网格中取目标模板自己的最高分。
             before_name, weapon_point, before_score = self.find_inventory_icon(
-                self.weapon_variant_templates
+                {target: self.weapon_variant_templates.get(target)}
             )
             weapon_threshold = float(action_cfg.get("weapon_match_threshold", 0.78))
             if weapon_point is None or before_score < weapon_threshold:
@@ -1344,19 +1394,21 @@ class Bot:
                 before_score,
                 "BOSS" if target == "boss" else "刷怪",
             )
+            self._boss_weapon_active = None
             self.window.double_click_normalized(
                 weapon_point,
                 interval_seconds=float(action_cfg.get("double_click_interval_seconds", 0.12)),
                 live=self.live,
             )
             self.wait(float(action_cfg.get("post_weapon_switch_seconds", 0.8)))
+            expected_after = "farm" if target == "boss" else "boss"
             after_name, _, after_score = self.find_inventory_icon(
-                self.weapon_variant_templates
+                {expected_after: self.weapon_variant_templates.get(expected_after)},
+                near_point=weapon_point,
             )
             if (
-                after_name is None
+                after_name != expected_after
                 or after_score < weapon_threshold
-                or after_name == before_name
             ):
                 logging.warning(
                     "双击后未确认武器图标已改变（切换前 %s，切换后 %s/%.3f），不更新内部装备状态。",
@@ -1524,17 +1576,29 @@ class Bot:
                 if self.map_visible():
                     logging.info("关闭遮挡面板后检测到地图已经打开。")
                     return
+            open_key = str(map_cfg.get("open_key", "M")).upper()
+            if open_key not in VK:
+                raise RuntimeError(f"地图快捷键 {open_key!r} 不受支持。")
             logging.info(
-                "点击右上角小地图并验证地图界面，第 %s/%s 次。",
+                "按 %s 打开地图并验证，第 %s/%s 次。",
+                open_key,
                 attempt,
                 total_attempts,
             )
-            self.click("map_button")
+            self.window.tap_key(open_key, live=self.live)
             if not self.wait(self.cfg["timing"]["map_open_seconds"]):
                 return
             if self.map_visible():
                 logging.info("已确认地图界面打开。")
                 return
+            if bool(map_cfg.get("fallback_click_minimap", True)):
+                logging.info("快捷键未确认地图，回退点击右上角小地图。")
+                self.click("map_button")
+                if not self.wait(self.cfg["timing"]["map_open_seconds"]):
+                    return
+                if self.map_visible():
+                    logging.info("点击小地图后已确认地图界面打开。")
+                    return
         raise RuntimeError(
             f"初次尝试及 {recovery_rounds} 轮恢复后仍未检测到地图界面；"
             "请运行“重新校准小地图.bat”。"
@@ -1647,6 +1711,64 @@ class Bot:
         logging.warning("疲劳 OCR 连续 %s 轮均未识别成功。", refresh_rounds)
         return None
 
+    def runtime_fatigue(self) -> Optional[int]:
+        if self.runtime_probe is None:
+            return None
+        snapshot = self.runtime_probe.snapshot()
+        if not snapshot.get("available") or snapshot.get("latest_fatigue") is None:
+            return None
+        stale_seconds = max(
+            30.0,
+            float(
+                self.cfg["fatigue"].get(
+                    "runtime_stale_fallback_seconds", 180.0
+                )
+            ),
+        )
+        fatigue_age = snapshot.get("fatigue_age_seconds")
+        if fatigue_age is not None and float(fatigue_age) >= stale_seconds:
+            return None
+        value = int(snapshot["latest_fatigue"])
+        if -1000 <= value <= 1000:
+            self.last_fatigue = value
+            return value
+        return None
+
+    def read_fatigue_preferred(
+        self, attempts: int = 3, refresh_rounds: int = 1
+    ) -> Optional[int]:
+        if self.runtime_probe is not None:
+            snapshot = self.runtime_probe.snapshot()
+            if snapshot.get("available"):
+                stale_seconds = max(
+                    30.0,
+                    float(
+                        self.cfg["fatigue"].get(
+                            "runtime_stale_fallback_seconds", 180.0
+                        )
+                    ),
+                )
+                provider_age = snapshot.get("fatigue_age_seconds")
+                if provider_age is None:
+                    provider_age = snapshot.get("ready_age_seconds")
+                if provider_age is None or float(provider_age) < stale_seconds:
+                    value = self.runtime_fatigue()
+                    if value is not None:
+                        logging.debug("使用 Mono 运行时疲劳值：%s/1000。", value)
+                        return value
+                    logging.debug(
+                        "Mono 运行时已连接但尚无新疲劳值；"
+                        "保持无 OCR 监测。"
+                    )
+                    return None
+                logging.warning(
+                    "Mono 疲劳数据已超过 %.0f 秒未更新，本次降级为 OCR。",
+                    stale_seconds,
+                )
+            else:
+                logging.warning("Mono 运行时不可用，本次降级为 OCR。")
+        return self.read_fatigue(attempts=attempts, refresh_rounds=refresh_rounds)
+
     def normal_farm_until_low(self) -> None:
         logging.info("状态：普通区域挂机。")
         self.set_phase("normal_combat", combat=True)
@@ -1672,8 +1794,18 @@ class Bot:
                 continue
             now = time.monotonic()
             self.run_due_combat_inputs(schedule)
+            runtime_fatigue = self.runtime_fatigue()
+            if (
+                runtime_fatigue is not None
+                and runtime_fatigue <= self.cfg["fatigue"]["low_threshold"]
+            ):
+                logging.warning(
+                    "Mono 疲劳 %s 低于阈值，转入 BOSS 循环。",
+                    runtime_fatigue,
+                )
+                return
             if now >= next_fatigue:
-                fatigue = self.read_fatigue()
+                fatigue = self.read_fatigue_preferred()
                 next_fatigue = now + self.cfg["fatigue"]["check_interval_seconds"]
                 if fatigue is not None and fatigue <= self.cfg["fatigue"]["low_threshold"]:
                     logging.warning("疲劳 %s 低于阈值，转入 BOSS 循环。", fatigue)
@@ -1688,7 +1820,10 @@ class Bot:
             self.wait(self.cfg["timing"].get("combat_input_quiet_seconds", 1.0))
             self.open_map()
             self.click("normal_portal_marker")
-            self.wait(self.cfg["timing"]["normal_auto_path_seconds"])
+            self.wait_navigation_with_mount(
+                self.cfg["timing"]["normal_auto_path_seconds"],
+                "前往副本入口",
+            )
             if self.revive_epoch == revive_epoch:
                 return
             logging.info("寻路期间发生过复活，重新打开地图并下发入口寻路。")
@@ -1696,27 +1831,40 @@ class Bot:
     def enter_dungeon(self) -> None:
         logging.info("状态：触发入口并进入冰牙海湾。")
         self.set_phase("entering_dungeon")
+        if self.runtime_probe is not None:
+            # 在新副本实体生成前清除上一轮状态；Boss.OnShow 随后的事件会
+            # 重新建立本轮目标，不能等到开战时再把它清掉。
+            self.runtime_probe.reset_boss_state()
         self.trigger_entrance_panel()
         self.click("enter_dungeon_button")
         self.wait(self.cfg["timing"]["dungeon_load_seconds"])
-        self.mount_for_dungeon()
 
-    def mount_for_dungeon(self) -> None:
-        """进入副本后骑乘宠物；此动作只依赖快捷键，不依赖任何屏幕坐标。"""
-        mount_cfg = self.cfg.get("dungeon_mount", {})
+    def wait_navigation_with_mount(self, total_seconds: float, context: str) -> None:
+        """自动寻路开始后按 F 骑乘，并等待剩余寻路时间。"""
+        mount_cfg = self.cfg.get(
+            "travel_mount", self.cfg.get("dungeon_mount", {})
+        )
+        total_seconds = max(0.0, float(total_seconds))
         if not bool(mount_cfg.get("enabled", True)) or self.stopped:
+            self.wait(total_seconds)
             return
         key = str(mount_cfg.get("key", "F")).upper()
         if key not in VK:
-            raise RuntimeError(f"骑乘快捷键 {key!r} 不受支持，请检查 dungeon_mount.key。")
-        logging.info("状态：进入副本后按 %s 骑乘宠物。", key)
-        self.set_phase("dungeon_mounting")
+            raise RuntimeError(f"骑乘快捷键 {key!r} 不受支持，请检查 travel_mount.key。")
+        delay = min(
+            total_seconds,
+            max(0.0, float(mount_cfg.get("after_path_click_seconds", 0.4))),
+        )
+        self.wait(delay)
+        logging.info("%s途中按 %s 骑乘宠物。", context, key)
         self.window.tap_key(
             key,
             hold_seconds=max(0.02, float(mount_cfg.get("hold_seconds", 0.08))),
             live=self.live,
         )
-        self.wait(max(0.0, float(mount_cfg.get("settle_seconds", 0.8))))
+        settle = max(0.0, float(mount_cfg.get("settle_seconds", 0.8)))
+        self.wait(settle)
+        self.wait(max(0.0, total_seconds - delay - settle))
 
     def travel_to_boss(self) -> None:
         logging.info("状态：副本内地图寻路到 BOSS。")
@@ -1725,10 +1873,24 @@ class Bot:
             revive_epoch = self.revive_epoch
             self.open_map()
             self.click("dungeon_boss_marker")
+            # 副本内按 F 会切换骑乘并打断已开始的前进。
+            # 骑乘只用于普通世界的入口/刷怪点寻路。
             self.wait(self.cfg["timing"]["boss_auto_path_seconds"])
             if self.revive_epoch == revive_epoch:
                 return
             logging.info("副本寻路期间发生过复活，重新下发 BOSS 寻路。")
+
+    def travel_to_farm_spot(self) -> None:
+        logging.info("状态：返回普通刷怪点。")
+        self.set_phase("farm_navigation")
+        self.wait(self.cfg["timing"].get("combat_input_quiet_seconds", 1.0))
+        self.open_map()
+        self.click("farm_spot_marker")
+        self.wait_navigation_with_mount(
+            self.cfg["timing"].get("farm_auto_path_seconds", 15.0),
+            "返回刷怪点",
+        )
+        logging.info("已到达刷怪点，恢复普通刷怪。")
 
     def fight_boss(self) -> bool:
         logging.info("状态：寻找并攻击 BOSS。")
@@ -1736,13 +1898,56 @@ class Bot:
         self.log_tail.boss_seen = False
         self.log_tail.boss_dead = False
         combat_cfg = self.cfg["combat"]
-        fatigue_fallback_enabled = bool(
+        detection_mode = str(
+            combat_cfg.get("boss_death_detection_mode", "log_first")
+        ).strip().lower()
+        valid_detection_modes = {"runtime_first", "log_first", "log_only", "ocr_only"}
+        if detection_mode not in valid_detection_modes:
+            raise ValueError(
+                "combat.boss_death_detection_mode 必须是 "
+                "runtime_first、log_first、log_only 或 ocr_only"
+            )
+        runtime_snapshot = (
+            self.runtime_probe.snapshot() if self.runtime_probe is not None else {}
+        )
+        runtime_detection_enabled = bool(runtime_snapshot.get("available")) and (
+            detection_mode == "runtime_first"
+        )
+        log_detection_enabled = detection_mode in {
+            "runtime_first",
+            "log_first",
+            "log_only",
+        }
+        fatigue_fallback_enabled = detection_mode in {
+            "runtime_first",
+            "log_first",
+            "ocr_only",
+        }
+        # 兼容旧配置中的总开关；显式 false 只关闭 OCR 提供器，不影响日志。
+        fatigue_fallback_enabled = fatigue_fallback_enabled and bool(
             combat_cfg.get("boss_fatigue_fallback_enabled", True)
         )
+        # Mono 能读取后，BOSS 死亡由 OnDead/HP/日志确认，战斗中
+        # 不再定时加载 EasyOCR。只有探针本身不可用时才允许 OCR 兜底。
+        fatigue_fallback_enabled = (
+            fatigue_fallback_enabled and not runtime_detection_enabled
+        )
+        logging.info(
+            "BOSS 死亡检测模式：%s（Mono运行时=%s，日志=%s，OCR兜底=%s）。",
+            detection_mode,
+            "启用" if runtime_detection_enabled else "不可用/关闭",
+            "启用" if log_detection_enabled else "关闭",
+            "启用" if fatigue_fallback_enabled else "关闭",
+        )
         fatigue_baseline = self.last_fatigue
-        if fatigue_fallback_enabled and fatigue_baseline is None:
+        if (
+            fatigue_fallback_enabled
+            and fatigue_baseline is None
+            and not runtime_detection_enabled
+        ):
             logging.info("尚无战前疲劳基准，先读取一次用于 BOSS 死亡兜底判断。")
             fatigue_baseline = self.read_fatigue(attempts=3, refresh_rounds=1)
+        runtime_fatigue_baseline = runtime_snapshot.get("latest_fatigue")
         fatigue_probe_delay = max(
             1.0,
             float(combat_cfg.get("boss_fatigue_probe_initial_delay_seconds", 12.0)),
@@ -1766,18 +1971,52 @@ class Bot:
                 schedule = self.new_combat_schedule(boss=True)
                 continue
             self.run_due_combat_inputs(schedule)
+            if runtime_detection_enabled and self.runtime_probe is not None:
+                runtime_snapshot = self.runtime_probe.snapshot()
+                if runtime_snapshot.get("boss_dead"):
+                    logging.info(
+                        "Mono 运行时确认 BOSS 已死亡（%s）。",
+                        runtime_snapshot.get("death_source"),
+                    )
+                    return True
+                runtime_fatigue = runtime_snapshot.get("latest_fatigue")
+                if (
+                    runtime_snapshot.get("boss_seen")
+                    and runtime_fatigue_baseline is not None
+                    and runtime_fatigue is not None
+                    and int(runtime_fatigue) - int(runtime_fatigue_baseline)
+                    >= fatigue_gain_threshold
+                ):
+                    logging.info(
+                        "Mono 运行时已识别目标 BOSS，且 HuntFatigueSyncEvent 从 %s "
+                        "恢复到 %s；确认 BOSS 已死亡。",
+                        runtime_fatigue_baseline,
+                        runtime_fatigue,
+                    )
+                    return True
             self.log_tail.poll()
-            if self.log_tail.boss_seen:
+            if log_detection_enabled and self.log_tail.boss_seen:
                 logging.info("日志已识别 BOSS 实体 %s。", self.cfg["combat"]["boss_entity_id"])
-            if self.log_tail.boss_dead:
+            if log_detection_enabled and self.log_tail.boss_dead:
                 logging.info("日志确认 BOSS 已死亡。")
                 return True
             now = time.monotonic()
             if (
                 fatigue_fallback_enabled
-                and fatigue_baseline is not None
                 and now >= next_fatigue_probe
             ):
+                if fatigue_baseline is None:
+                    logging.warning(
+                        "Mono 运行时尚未确认死亡，开始加载 OCR 建立兜底基准。"
+                    )
+                    fatigue_baseline = self.read_fatigue(
+                        attempts=3, refresh_rounds=1
+                    )
+                    schedule = self.new_combat_schedule(boss=True)
+                    next_fatigue_probe = (
+                        time.monotonic() + fatigue_probe_interval
+                    )
+                    continue
                 # 某些游戏运行状态不再向 Player.log 输出战斗诊断。BOSS 击杀
                 # 仍会立即恢复约 100 点疲劳，因此用战前值作独立兜底。第一次
                 # 达到阈值后立刻再读一次，避免一次 OCR 误读导致提前退出。
@@ -1819,7 +2058,8 @@ class Bot:
         if self.stopped:
             return False
         logging.warning(
-            "BOSS 战超时，未从日志检测到 BOSS 死亡；将退出本次副本并继续恢复流程。"
+            "BOSS 战超时，启用的死亡检测来源均未确认击杀；"
+            "将退出本次副本并继续恢复流程。"
         )
         return False
 
@@ -1862,6 +2102,19 @@ class Bot:
                     completed_runs,
                     minimum_runs,
                 )
+                runtime_fatigue = self.runtime_fatigue()
+                if (
+                    runtime_fatigue is not None
+                    and runtime_fatigue >= self.cfg["fatigue"]["boss_target"]
+                ):
+                    logging.info(
+                        "Mono 疲劳已恢复到 %s，立即结束 BOSS 循环。",
+                        runtime_fatigue,
+                    )
+                    self.switch_weapon("farm")
+                    self.sell_cycle_medicine()
+                    self.travel_to_farm_spot()
+                    return
                 if completed_runs < minimum_runs:
                     continue
             else:
@@ -1879,10 +2132,13 @@ class Bot:
                     )
                 ),
             )
-            fatigue = self.read_fatigue(refresh_rounds=1 + extra_ocr_rounds)
+            fatigue = self.read_fatigue_preferred(
+                refresh_rounds=1 + extra_ocr_rounds
+            )
             if fatigue is None:
                 logging.warning(
-                    "退出副本后追加 OCR 仍未识别疲劳值；不中断挂机，继续下一次副本。"
+                    "退出副本后尚未获得可用疲劳值；"
+                    "不中断挂机，继续下一次副本。"
                 )
                 continue
             if fatigue >= self.cfg["fatigue"]["boss_target"]:
@@ -1891,6 +2147,7 @@ class Bot:
                 # 紧凑排列，因此必须保持这个顺序，避免武器格提前发生位移。
                 self.switch_weapon("farm")
                 self.sell_cycle_medicine()
+                self.travel_to_farm_spot()
                 return
             logging.info("疲劳仍为 %s，准备再次进入副本。", fatigue)
 
@@ -1917,6 +2174,7 @@ class Bot:
         required = [
             "map_button",
             "normal_portal_marker",
+            "farm_spot_marker",
             "enter_dungeon_button",
             "dungeon_boss_marker",
             "exit_dungeon_button",
@@ -1960,10 +2218,15 @@ class Bot:
                 self.running = False
                 winsound.Beep(450, 500)
 
+    def close(self) -> None:
+        if self.runtime_probe is not None:
+            self.runtime_probe.stop()
+
 
 CALIBRATION_STEPS = [
     ("map_button", "普通HUD：把鼠标移到用于打开大地图的位置"),
     ("normal_portal_marker", "打开普通区域大地图：把鼠标移到冰牙海湾入口的地图点位"),
+    ("farm_spot_marker", "打开普通区域地图：把鼠标移到疲劳恢复后要返回的刷怪位置"),
     ("enter_dungeon_button", "触发副本面板：把鼠标移到“进入副本”按钮中心"),
     ("dungeon_boss_marker", "进入副本并打开大地图：把鼠标移到最远端BOSS点位"),
     ("exit_dungeon_button", "副本HUD：把鼠标移到右上角“退出副本”按钮中心"),
@@ -2050,6 +2313,32 @@ def calibrate_map_button(cfg: dict) -> None:
     save_config(cfg)
     winsound.Beep(1000, 250)
     print(f"小地图位置已记录：客户区 ({cx}, {cy})，配置 {cfg['coordinates']['map_button']}")
+
+
+def calibrate_farm_marker(cfg: dict) -> None:
+    """只记录普通地图上的刷怪返回点，不要求重录其他坐标。"""
+    window = GameWindow(cfg["window_title"])
+    window.locate()
+    w, h = window.client_size()
+    print(f"找到游戏客户区：{w}x{h}")
+    print("请回到普通 HUD，按 M 打开地图。")
+    print("把鼠标放到疲劳恢复到 800 以上后希望自动返回的刷怪位置，然后按 F2。")
+    print("按 F12 取消；校准过程不会自动点击地图目标。")
+    winsound.Beep(750, 120)
+    if not wait_key_edge(VK["F2"]):
+        print("已取消刷怪点校准。")
+        return
+    sx, sy = win32api.GetCursorPos()
+    cx, cy = win32gui.ScreenToClient(window.hwnd, (sx, sy))
+    if not (0 <= cx < w and 0 <= cy < h):
+        raise RuntimeError(f"记录点 ({cx}, {cy}) 不在游戏客户区内。")
+    cfg["coordinates"]["farm_spot_marker"] = window.client_to_normalized((cx, cy))
+    save_config(cfg)
+    winsound.Beep(1000, 250)
+    print(
+        f"刷怪点已记录：客户区 ({cx}, {cy})，"
+        f"配置 {cfg['coordinates']['farm_spot_marker']}"
+    )
 
 
 def calibrate_inventory(cfg: dict) -> None:
@@ -2297,6 +2586,7 @@ def inventory_detection_test(cfg: dict) -> None:
         print("背包识别测试通过；没有换武器、拖拽物品或执行出售。")
     finally:
         bot.close_optional_panels()
+        bot.close()
 
 
 def merge_config_overrides(target: dict, overrides: dict) -> None:
@@ -2349,6 +2639,7 @@ def full_chain_smoke_test(cfg: dict, cycles: int = 2) -> None:
             logging.info("完整链路冒烟测试第 %s/%s 轮完成。", cycle_index, cycles)
     finally:
         bot.window.release_keys(("A", "SPACE", "Q", "W"), live=True)
+        bot.close()
 
     expected_keys = {
         str(test_cfg["combat"]["attack_key"]).upper(),
@@ -2370,6 +2661,7 @@ def main() -> int:
     parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     parser.add_argument("--calibrate", action="store_true", help="运行一次性坐标校准")
     parser.add_argument("--calibrate-map", action="store_true", help="只重新校准右上角小地图")
+    parser.add_argument("--calibrate-farm", action="store_true", help="只校准疲劳恢复后的刷怪返回点")
     parser.add_argument(
         "--calibrate-inventory",
         action="store_true",
@@ -2433,6 +2725,9 @@ def main() -> int:
     if args.calibrate_map:
         calibrate_map_button(cfg)
         return 0
+    if args.calibrate_farm:
+        calibrate_farm_marker(cfg)
+        return 0
     if args.calibrate_inventory:
         calibrate_inventory(cfg)
         return 0
@@ -2467,8 +2762,11 @@ def main() -> int:
         choice = input("输入 1 或 2，直接回车默认 1：").strip()
         mode = "dungeon" if choice == "2" else "full"
     bot = Bot(cfg, live=args.live, mode=mode)
-    bot.run()
-    win32api.CloseHandle(instance_mutex)
+    try:
+        bot.run()
+    finally:
+        bot.close()
+        win32api.CloseHandle(instance_mutex)
     return 0
 
 
