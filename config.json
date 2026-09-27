@@ -146,6 +146,8 @@
     "_boss_death_detection_mode_comment": "BOSS 死亡检测来源。runtime_first=Mono 运行时事件优先、Player.log 次之，Mono 可用时不加载 OCR；log_first=日志优先、OCR 兜底；log_only=只读日志；ocr_only=只用疲劳 OCR。",
     "runtime_probe_enabled": true,
     "_runtime_probe_enabled_comment": "是否允许只读附加到游戏的 Mono 运行时，监听 KillInfo、HP/LifeDead 和 HuntFatigue 同步。false 会完全取消进程附加，并自动回退到日志/OCR。",
+    "easyocr_enabled": false,
+    "_easyocr_enabled_comment": "是否安装并启用 EasyOCR 备用识别。false 时完整链路只使用 Frida/日志，不下载 torch、torchvision 和 EasyOCR。",
     "boss_fatigue_fallback_enabled": true,
     "_boss_fatigue_fallback_enabled_comment": "兼容旧配置的 OCR 总开关。false 会关闭 OCR 提供器但不影响日志；通常保持 true，并优先通过 boss_death_detection_mode 选择策略。",
     "boss_fatigue_probe_initial_delay_seconds": 12.0,

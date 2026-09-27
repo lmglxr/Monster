@@ -33,6 +33,7 @@ FIELDS = [
         ("启用 W 技能", ("combat", "skill_w_enabled"), "bool", None),
         ("W 技能间隔（秒）", ("combat", "skill_w_interval_seconds"), "float", None),
         ("启用 Frida Mono 探针", ("combat", "runtime_probe_enabled"), "bool", "需要 Frida 能够附加游戏进程"),
+        ("启用 EasyOCR 备用识别", ("combat", "easyocr_enabled"), "bool", "关闭可跳过 torch、torchvision 和 OCR 模型下载"),
     ]),
     ("背包与武器", [
         ("启用背包自动化", ("inventory_automation", "enabled"), "bool", None),

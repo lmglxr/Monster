@@ -29,11 +29,13 @@
 
 低帧率或界面加载较慢的笔记本可以改为双击 `启动挂机MVP-笔记本.bat`。它会在正式 `config.json` 之上加载 `laptop_config.json`，增加焦点稳定、疲劳提示、OCR 重试、地图、寻路、背包和场景加载的等待时间，但不会改变正式疲劳阈值、坐标或技能周期。普通启动入口不受影响。
 
-电脑没有 Python 时，首次启动会优先通过 Windows 自带的 `winget` 安装 Python 3.12。也可以先自行安装 Python 3.10～3.12，再双击 `一键安装.bat`。项目使用自己的 `.venv`，不会修改其他 Python 项目的包。
+电脑没有 Python 时，首次启动会优先通过 Windows 自带的 `winget` 安装 Python 3.12。也可以先自行安装 Python 3.10～3.12，再双击 `一键安装.bat`。项目使用自己的 `.venv`，不会修改其他 Python 项目的包。默认只安装 Frida、OpenCV 等核心依赖；只有在 `combat.easyocr_enabled` 设置为 `true` 时，才额外安装 torch、torchvision 和 EasyOCR。
 
-如果要先给别人做安全验收，建议只提供 `完整链路冒烟测试.bat`（笔记本使用 `完整链路冒烟测试-笔记本.bat`）。入口会先自动创建/检查 `.venv`；如果发现 `frida` 或其他依赖缺失，会自动下载并安装 `requirements.txt` 后重新验证；随后检查 Python 和项目资源、提前准备 EasyOCR 模型，并对已启动的 `CreatureCurios.exe` 做一次 Frida 只读附加/分离测试，确认 `mono-2.0-bdwgc.dll` 存在后才会真实控制游戏。环境检测失败时不会进入冒烟流程。
+如果要先给别人做安全验收，建议只提供 `完整链路冒烟测试.bat`（笔记本使用 `完整链路冒烟测试-笔记本.bat`）。入口会先自动创建/检查 `.venv`；如果发现 `frida` 或其他核心依赖缺失，会自动下载并安装后重新验证；只有开启 `combat.easyocr_enabled` 时才安装 OCR 依赖并准备 EasyOCR 模型。随后会对已启动的 `CreatureCurios.exe` 做一次 Frida 只读附加/分离测试，确认 `mono-2.0-bdwgc.dll` 存在后才会真实控制游戏。环境检测失败时不会进入冒烟流程。
 
 也可以双击 `参数配置器.bat` 打开图形化参数界面。界面会读取并保存 `config.json`，可以直接启动完整链路冒烟测试或挂机 MVP；启动后切回游戏按 `F8` 开始/暂停，按 `F12` 停止。第一版界面只开放常用参数，坐标和高级诊断参数仍建议使用原有校准工具或直接编辑配置文件。
+
+依赖安装会自动依次尝试清华、阿里、腾讯和官方 PyPI 源，不要求用户提前配置镜像。也可以在安装前设置 `CURIOUS_BEAST_PIP_INDEX` 指定自己的 Python 源。默认关闭 EasyOCR 时不下载其模型；需要 OCR 备用识别时，再打开参数并重新运行冒烟测试，程序会自动安装 OCR 依赖并准备模型。
 
 仓库可以克隆到任意目录，无须放进 Steam 游戏目录。默认的 `log_path: "auto"` 会根据正在运行的游戏进程自动找到 `Logs/Player.log`。
 

@@ -1767,6 +1767,9 @@ class Bot:
                 )
             else:
                 logging.warning("Mono 运行时不可用，本次降级为 OCR。")
+        if not bool(self.cfg.get("combat", {}).get("easyocr_enabled", False)):
+            logging.warning("EasyOCR 未启用，跳过疲劳 OCR 备用识别。")
+            return None
         return self.read_fatigue(attempts=attempts, refresh_rounds=refresh_rounds)
 
     def normal_farm_until_low(self) -> None:
@@ -1926,6 +1929,9 @@ class Bot:
         # 兼容旧配置中的总开关；显式 false 只关闭 OCR 提供器，不影响日志。
         fatigue_fallback_enabled = fatigue_fallback_enabled and bool(
             combat_cfg.get("boss_fatigue_fallback_enabled", True)
+        )
+        fatigue_fallback_enabled = fatigue_fallback_enabled and bool(
+            combat_cfg.get("easyocr_enabled", False)
         )
         # Mono 能读取后，BOSS 死亡由 OnDead/HP/日志确认，战斗中
         # 不再定时加载 EasyOCR。只有探针本身不可用时才允许 OCR 兜底。

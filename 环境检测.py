@@ -11,6 +11,8 @@ from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
 REQUIREMENTS = APP_DIR / "requirements.txt"
+OCR_REQUIREMENTS = APP_DIR / "requirements-ocr.txt"
+INSTALLER = APP_DIR / "安装依赖.py"
 VERSION_FILE = APP_DIR / "version.json"
 
 
@@ -21,9 +23,9 @@ def read_version() -> dict:
         return {"version": "unknown", "python": ["3.10", "3.11", "3.12"]}
 
 
-def required_packages() -> list[tuple[str, str]]:
+def required_packages(requirements: Path = REQUIREMENTS) -> list[tuple[str, str]]:
     packages: list[tuple[str, str]] = []
-    for line in REQUIREMENTS.read_text(encoding="utf-8").splitlines():
+    for line in requirements.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -47,32 +49,24 @@ def check_python(version_info: dict) -> bool:
     return True
 
 
-def check_packages() -> bool:
+def check_packages(requirements: Path = REQUIREMENTS, label: str = "") -> bool:
     success = True
-    for distribution, import_name in required_packages():
+    for distribution, import_name in required_packages(requirements):
         try:
             installed = metadata.version(distribution)
             importlib.import_module(import_name)
-            print(f"[通过] {distribution} {installed}")
+            print(f"[通过] {label}{distribution} {installed}")
         except Exception as exc:
             print(f"[失败] {distribution}: {exc}")
             success = False
     return success
 
 
-def install_requirements() -> bool:
+def install_requirements(ocr_enabled: bool) -> bool:
     print("[开始] 检查到依赖缺失，正在自动下载/修复 requirements.txt 中的模块……")
-    command = [
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "--disable-pip-version-check",
-        "--index-url",
-        "https://pypi.org/simple",
-        "-r",
-        str(REQUIREMENTS),
-    ]
+    command = [sys.executable, str(INSTALLER)]
+    if ocr_enabled:
+        command.append("--ocr")
     try:
         result = subprocess.run(command, cwd=APP_DIR, check=False)
     except OSError as exc:
@@ -178,15 +172,29 @@ def main() -> int:
     print(f"Curious Beast 冒烟测试环境检测 v{version_info.get('version', 'unknown')}")
     print("=" * 58)
     python_ok = check_python(version_info)
+    try:
+        config = json.loads((APP_DIR / "config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        config = {}
+    combat_cfg = config.get("combat", {})
+    ocr_enabled = bool(combat_cfg.get("easyocr_enabled", False))
+    print(f"EasyOCR 模式：{'启用' if ocr_enabled else '关闭（仅使用 Frida/日志）'}")
     packages_ok = check_packages()
-    if not packages_ok and args.install_missing and python_ok:
-        packages_ok = install_requirements() and check_packages()
+    ocr_packages_ok = True
+    if ocr_enabled:
+        ocr_packages_ok = check_packages(OCR_REQUIREMENTS, "OCR ")
+    if args.install_missing and python_ok and (not packages_ok or not ocr_packages_ok):
+        packages_ok = install_requirements(ocr_enabled) and check_packages()
+        ocr_packages_ok = True
+        if ocr_enabled:
+            ocr_packages_ok = check_packages(OCR_REQUIREMENTS, "OCR ")
     checks = [
         python_ok,
         packages_ok,
         check_project_files(),
-        prepare_ocr_model(args.download_model),
+        prepare_ocr_model(args.download_model and ocr_enabled),
         check_frida_attach(args.check_game_attach),
+        ocr_packages_ok,
     ]
     print("=" * 58)
     if all(checks):
