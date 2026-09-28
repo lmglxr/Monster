@@ -41,7 +41,7 @@ ASSET_DIR = APP_DIR / "assets"
 RUNTIME_LOG = APP_DIR / "runtime.log"
 MONO_PROBE_SCRIPT = APP_DIR / "mono_runtime_probe.js"
 DEBUG_DIR = APP_DIR / "debug"
-APP_VERSION = "0.0.2"
+APP_VERSION = "0.0.3"
 
 VK = {
     "A": 0x41,
@@ -750,10 +750,22 @@ class Bot:
         )
         self.log_tail.start_at_end()
         self.runtime_probe: Optional[MonoRuntimeProbe] = None
+        self._monster_death_log_state: dict[int, tuple[float, int]] = {}
+        self._monster_death_log_state: dict[int, tuple[float, int]] = {}
         combat_cfg = cfg.get("combat", {})
+        dark_cfg = cfg.get("dark_boss", {})
+        dark_hp_probe_required = (
+            mode == "dungeon"
+            and bool(dark_cfg.get("enabled", False))
+            and str(dark_cfg.get("identification_mode", "image")).lower()
+            == "runtime_hp"
+        )
         if (
-            str(combat_cfg.get("boss_death_detection_mode", "log_first")).lower()
-            == "runtime_first"
+            (
+                str(combat_cfg.get("boss_death_detection_mode", "log_first")).lower()
+                == "runtime_first"
+                or dark_hp_probe_required
+            )
             and bool(combat_cfg.get("runtime_probe_enabled", True))
         ):
             self.runtime_probe = MonoRuntimeProbe(
@@ -772,6 +784,7 @@ class Bot:
         self.shop_template = self._load_gray_template("general_store_title.png")
         self.sell_quantity_template = self._load_gray_template("sell_quantity_title.png")
         self.medicine_item_template = self._load_gray_template("medicine_item_icon.png")
+        self.dark_boss_template = self._load_color_template("dark_shark_boss.png")
         self.weapon_variant_templates = {
             "farm": self._load_gray_template("weapon_variant_a_icon.png"),
             "boss": self._load_gray_template("weapon_variant_b_icon.png"),
@@ -791,6 +804,9 @@ class Bot:
         self._boss_weapon_active: Optional[bool] = False
         self._inventory_missing_warned = False
         self.combat_input_counts: Counter[str] = Counter()
+        # 只刷暗黑鲨鱼模式单独维护骑乘状态，避免出副本已上坐骑后，
+        # 下一轮前往入口又按一次 F 反而下坐骑。
+        self._dark_shark_mounted = False
 
     @staticmethod
     def _load_gray_template(name: str) -> Optional[np.ndarray]:
@@ -799,6 +815,14 @@ class Bot:
             logging.warning("缺少模板：%s", path)
             return None
         return cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+
+    @staticmethod
+    def _load_color_template(name: str) -> Optional[np.ndarray]:
+        path = ASSET_DIR / name
+        if not path.exists():
+            logging.warning("缺少彩色模板：%s", path)
+            return None
+        return cv2.imread(str(path), cv2.IMREAD_COLOR)
 
     def check_control_keys(self) -> None:
         f12_down = pressed(VK["F12"])
@@ -1182,6 +1206,183 @@ class Bot:
         _, score, _, loc = cv2.minMaxLoc(result)
         center = (loc[0] + resized.shape[1] // 2, loc[1] + resized.shape[0] // 2)
         return center, float(score)
+
+    def dark_boss_match(self, frame: np.ndarray) -> tuple[Optional[tuple[int, int]], float]:
+        """在 Boss 战斗画面中寻找暗黑鲨鱼模板。
+
+        暗黑鲨鱼会移动、转向并因分辨率而改变大小，因此这里在画面中部
+        的可配置区域内尝试多个相邻尺度，而不是只用固定坐标或单一尺寸。
+        """
+        template = self.dark_boss_template
+        if template is None:
+            return None, 0.0
+        height, width = frame.shape[:2]
+        region = self.cfg.get("dark_boss", {}).get(
+            "search_region", [0.12, 0.10, 0.88, 0.90]
+        )
+        x1 = max(0, int(float(region[0]) * width))
+        y1 = max(0, int(float(region[1]) * height))
+        x2 = min(width, int(float(region[2]) * width))
+        y2 = min(height, int(float(region[3]) * height))
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None, 0.0
+
+        base_scale = width / float(self.cfg.get("reference_client_size", [1280, 720])[0])
+        best_score = -1.0
+        best_center: Optional[tuple[int, int]] = None
+        for multiplier in (0.78, 0.88, 1.0, 1.12, 1.24):
+            scale = max(0.1, base_scale * multiplier)
+            resized = cv2.resize(
+                template,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC,
+            )
+            if crop.shape[0] < resized.shape[0] or crop.shape[1] < resized.shape[1]:
+                continue
+            result = cv2.matchTemplate(crop, resized, cv2.TM_CCOEFF_NORMED)
+            _, score, _, loc = cv2.minMaxLoc(result)
+            if score > best_score:
+                best_score = float(score)
+                best_center = (
+                    x1 + loc[0] + resized.shape[1] // 2,
+                    y1 + loc[1] + resized.shape[0] // 2,
+                )
+        return best_center, best_score
+
+    def confirm_dark_boss(self) -> bool:
+        """确认当前副本 Boss 是否为暗黑鲨鱼。"""
+        dark_cfg = self.cfg.get("dark_boss", {})
+        if not bool(dark_cfg.get("enabled", False)):
+            return True
+        if str(dark_cfg.get("identification_mode", "image")).lower() == "runtime_hp":
+            return self.confirm_dark_boss_by_runtime_hp()
+        if self.dark_boss_template is None:
+            logging.warning("暗黑鲨鱼模板不存在，本轮跳过目标过滤，避免误退出。")
+            return True
+        threshold = float(dark_cfg.get("match_threshold", 0.52))
+        samples = max(1, int(dark_cfg.get("confirm_samples", 3)))
+        interval = max(0.05, float(dark_cfg.get("sample_interval_seconds", 0.35)))
+        hits = 0
+        best_score = 0.0
+        for index in range(samples):
+            if self.stopped:
+                return False
+            frame = self.capture_frame()
+            _, score = self.dark_boss_match(frame)
+            best_score = max(best_score, score)
+            logging.info(
+                "暗黑鲨鱼目标检测 %s/%s：分数 %.3f（阈值 %.3f）",
+                index + 1,
+                samples,
+                score,
+                threshold,
+            )
+            if score >= threshold:
+                hits += 1
+            if index + 1 < samples:
+                self.wait(interval)
+        required_hits = max(1, int(dark_cfg.get("required_hits", 2)))
+        accepted = hits >= min(required_hits, samples)
+        if accepted:
+            logging.info("已确认当前副本为暗黑鲨鱼（最高分 %.3f）。", best_score)
+        else:
+            logging.info(
+                "当前副本不是暗黑鲨鱼或画面尚未识别成功（命中 %s/%s，最高分 %.3f）；准备退出。",
+                hits,
+                samples,
+                best_score,
+            )
+        return accepted
+
+    def confirm_dark_boss_by_runtime_hp(self) -> bool:
+        """只用 Mono 报告的 Boss 初始 HP 判断目标，避免蓝色外观误匹配。"""
+        dark_cfg = self.cfg.get("dark_boss", {})
+        expected_hp = int(dark_cfg.get("dark_max_hp", 26000))
+        normal_hp = int(dark_cfg.get("normal_max_hp", 18000))
+        timeout = max(
+            0.5,
+            float(
+                dark_cfg.get(
+                    "boss_runtime_hp_timeout_seconds",
+                    dark_cfg.get("runtime_hp_timeout_seconds", 6.0),
+                )
+            ),
+        )
+        hp = self.read_runtime_boss_hp(timeout, "Boss 点")
+        if hp == expected_hp:
+            logging.info("已确认当前副本为暗黑鲨鱼，继续战斗。")
+            return True
+        if hp == normal_hp:
+            logging.info("已确认当前副本为普通 Boss，准备退出。")
+            return False
+        return False
+
+    def classify_dark_boss_after_entry(self) -> Optional[bool]:
+        """进入副本后立即读取 HP；True=暗黑鲨鱼，False=普通 Boss，None=超时/未知。"""
+        dark_cfg = self.cfg.get("dark_boss", {})
+        expected_hp = int(dark_cfg.get("dark_max_hp", 26000))
+        normal_hp = int(dark_cfg.get("normal_max_hp", 18000))
+        timeout = max(
+            0.5,
+            float(
+                dark_cfg.get(
+                    "entry_runtime_hp_timeout_seconds",
+                    dark_cfg.get("runtime_hp_timeout_seconds", 6.0),
+                )
+            ),
+        )
+        hp = self.read_runtime_boss_hp(timeout, "进入副本")
+        if hp == expected_hp:
+            logging.info("进入副本已确认暗黑鲨鱼：最大 HP=%s。", hp)
+            return True
+        if hp == normal_hp:
+            logging.info("进入副本已确认普通 Boss：最大 HP=%s。", hp)
+            return False
+        if hp is not None:
+            logging.warning(
+                "进入副本读取到未知 Boss HP=%s（目标=%s，普通=%s），本轮安全退出。",
+                hp,
+                expected_hp,
+                normal_hp,
+            )
+        return None
+
+    def read_runtime_boss_hp(
+        self, timeout: float, context: str
+    ) -> Optional[int]:
+        """等待并返回当前 Boss 的最大 HP；只读 Mono，不使用画面猜测。"""
+        if self.runtime_probe is None:
+            logging.error(
+                "%s读取要求 Mono HP 判定，但运行时探针不可用。", context
+            )
+            return None
+        deadline = time.monotonic() + timeout
+        last_hp: Optional[int] = None
+        while time.monotonic() < deadline and not self.stopped:
+            snapshot = self.runtime_probe.snapshot()
+            hp = snapshot.get("latest_max_hp")
+            if hp is None:
+                hp = snapshot.get("latest_hp")
+            if hp is not None:
+                last_hp = int(hp)
+                logging.info(
+                    "Mono %s读取 Boss HP=%s（暗黑鲨鱼目标=%s，普通 Boss=%s）。",
+                    context,
+                    last_hp,
+                    self.cfg.get("dark_boss", {}).get("dark_max_hp", 26000),
+                    self.cfg.get("dark_boss", {}).get("normal_max_hp", 18000),
+                )
+                return last_hp
+            self.wait(0.1)
+        logging.warning(
+            "等待 Mono %s Boss HP 超时（最后读数=%s）。",
+            context,
+            last_hp,
+        )
+        return None
 
     def panel_visible(self) -> bool:
         _, score = self.template_match(self.capture_frame(), self.panel_template)
@@ -1830,6 +2031,24 @@ class Bot:
                 return
             logging.info("寻路期间发生过复活，重新打开地图并下发入口寻路。")
 
+    def travel_to_first_entrance_dark(self) -> None:
+        """暗黑鲨鱼模式专用入口路线，只有未骑乘时才按 F。"""
+        logging.info("状态：暗黑鲨鱼模式前往副本入口。")
+        self.set_phase("normal_navigation")
+        while not self.stopped:
+            revive_epoch = self.revive_epoch
+            self.wait(self.cfg["timing"].get("combat_input_quiet_seconds", 1.0))
+            self.open_map()
+            self.click("normal_portal_marker")
+            self.wait_navigation_with_mount(
+                self.cfg["timing"]["normal_auto_path_seconds"],
+                "前往副本入口（暗黑鲨鱼模式）",
+                mount_if_needed=not self._dark_shark_mounted,
+            )
+            if self.revive_epoch == revive_epoch:
+                return
+            logging.info("前往副本入口期间发生过复活，重新下发入口寻路。")
+
     def enter_dungeon(self) -> None:
         logging.info("状态：触发入口并进入冰牙海湾。")
         self.set_phase("entering_dungeon")
@@ -1841,13 +2060,23 @@ class Bot:
         self.click("enter_dungeon_button")
         self.wait(self.cfg["timing"]["dungeon_load_seconds"])
 
-    def wait_navigation_with_mount(self, total_seconds: float, context: str) -> None:
+    def wait_navigation_with_mount(
+        self,
+        total_seconds: float,
+        context: str,
+        *,
+        mount_if_needed: bool = True,
+    ) -> None:
         """自动寻路开始后按 F 骑乘，并等待剩余寻路时间。"""
         mount_cfg = self.cfg.get(
             "travel_mount", self.cfg.get("dungeon_mount", {})
         )
         total_seconds = max(0.0, float(total_seconds))
-        if not bool(mount_cfg.get("enabled", True)) or self.stopped:
+        if (
+            not bool(mount_cfg.get("enabled", True))
+            or not mount_if_needed
+            or self.stopped
+        ):
             self.wait(total_seconds)
             return
         key = str(mount_cfg.get("key", "F")).upper()
@@ -1864,6 +2093,8 @@ class Bot:
             hold_seconds=max(0.02, float(mount_cfg.get("hold_seconds", 0.08))),
             live=self.live,
         )
+        if "暗黑鲨鱼模式" in context:
+            self._dark_shark_mounted = True
         settle = max(0.0, float(mount_cfg.get("settle_seconds", 0.8)))
         self.wait(settle)
         self.wait(max(0.0, total_seconds - delay - settle))
@@ -1881,6 +2112,87 @@ class Bot:
             if self.revive_epoch == revive_epoch:
                 return
             logging.info("副本寻路期间发生过复活，重新下发 BOSS 寻路。")
+
+    def travel_to_dark_boss(self, *, probe_at_end: bool = True) -> None:
+        """暗黑鲨鱼专用副本路线：寻路途中不按 F，到终点统一切换坐骑状态。"""
+        logging.info("状态：暗黑鲨鱼专用路线寻路（到达终点后下坐骑）。")
+        self.set_phase("dungeon_navigation")
+        coordinates = self.cfg.get("coordinates", {})
+        path_cfg = self.cfg.get("dark_boss_path", {})
+        marker_name = "dark_boss_marker"
+        if (
+            not bool(path_cfg.get("use_dedicated_marker", True))
+            or not coordinates.get(marker_name)
+        ):
+            marker_name = "dungeon_boss_marker"
+            logging.info("未设置暗黑鲨鱼专用路径点，回退使用通用 BOSS 点。")
+        while not self.stopped:
+            revive_epoch = self.revive_epoch
+            self.open_map()
+            self.click(marker_name)
+            self.wait(
+                self.cfg["timing"].get(
+                    "dark_boss_auto_path_seconds",
+                    self.cfg["timing"].get("boss_auto_path_seconds", 14.0),
+                )
+            )
+            if self.revive_epoch == revive_epoch:
+                if probe_at_end:
+                    self.start_dark_boss_probe()
+                return
+            logging.info("暗黑鲨鱼专用寻路期间发生过复活，重新下发路线。")
+
+    def start_dark_boss_probe(self) -> None:
+        """到达 Boss 点后先按 A，让游戏下坐骑并上报 Boss 初始 HP。"""
+        path_cfg = self.cfg.get("dark_boss_path", {})
+        attack_key = str(self.cfg.get("combat", {}).get("attack_key", "A")).upper()
+        if attack_key not in VK:
+            raise RuntimeError(f"暗黑鲨鱼 Boss 探测攻击键 {attack_key!r} 不受支持。")
+        logging.info("已到达暗黑鲨鱼 Boss 终点，按 %s 触发下坐骑并读取初始 HP。", attack_key)
+        self.window.tap_key(
+            attack_key,
+            hold_seconds=max(0.02, float(self.cfg.get("combat", {}).get("combat_key_hold_seconds", 0.05))),
+            live=self.live,
+        )
+        self._dark_shark_mounted = False
+        self.wait(max(0.0, float(path_cfg.get("boss_probe_attack_settle_seconds", 0.5))))
+
+    def remount_after_dark_dungeon_exit(self) -> None:
+        """暗黑鲨鱼专用副本退出后重新上坐骑，准备下一轮入口寻路。"""
+        path_cfg = self.cfg.get("dark_boss_path", {})
+        if not bool(path_cfg.get("remount_after_exit", True)) or self.stopped:
+            return
+        key = str(path_cfg.get("mount_key", "F")).upper()
+        if key not in VK:
+            raise RuntimeError(f"暗黑鲨鱼路线骑乘键 {key!r} 不受支持。")
+        logging.info("已退出副本，按 %s 恢复骑乘。", key)
+        self.window.tap_key(
+            key,
+            hold_seconds=max(0.02, float(self.cfg.get("travel_mount", {}).get("hold_seconds", 0.08))),
+            live=self.live,
+        )
+        self._dark_shark_mounted = True
+        self.wait(max(0.0, float(path_cfg.get("mount_toggle_settle_seconds", 0.4))))
+
+    def dismount_before_dark_dungeon_exit(self) -> None:
+        """普通 Boss 在入口判定后先下坐骑，再退出副本。"""
+        if not self._dark_shark_mounted:
+            return
+        path_cfg = self.cfg.get("dark_boss_path", {})
+        key = str(path_cfg.get("mount_key", "F")).upper()
+        if key not in VK:
+            raise RuntimeError(f"暗黑鲨鱼路线骑乘键 {key!r} 不受支持。")
+        logging.info("普通 Boss 已确认，先按 %s 下坐骑，再退出副本。", key)
+        self.window.tap_key(
+            key,
+            hold_seconds=max(
+                0.02,
+                float(self.cfg.get("travel_mount", {}).get("hold_seconds", 0.08)),
+            ),
+            live=self.live,
+        )
+        self._dark_shark_mounted = False
+        self.wait(max(0.0, float(path_cfg.get("mount_toggle_settle_seconds", 0.4))))
 
     def travel_to_farm_spot(self) -> None:
         logging.info("状态：返回普通刷怪点。")
@@ -2158,22 +2470,142 @@ class Bot:
 
     def dungeon_only_loop(self) -> None:
         completed_runs = 0
+        entered_runs = 0
+        dark_boss_runs = 0
         logging.info("状态：只刷副本；不会读取疲劳，也不会返回普通挂机。")
+        self._dark_shark_mounted = False
         while not self.stopped:
-            self.travel_to_first_entrance()
+            self.travel_to_first_entrance_dark()
             self.enter_dungeon()
-            self.travel_to_boss()
+            entered_runs += 1
+            logging.info(
+                "只刷暗黑鲨鱼统计：进入副本 %s 次，实际战斗暗黑鲨鱼 %s 次。",
+                entered_runs,
+                dark_boss_runs,
+            )
+            entry_target = self.classify_dark_boss_after_entry()
+            if entry_target is not True:
+                if self.stopped:
+                    return
+                if entry_target is False:
+                    self.dismount_before_dark_dungeon_exit()
+                self.exit_dungeon()
+                self.remount_after_dark_dungeon_exit()
+                logging.info(
+                    "只刷暗黑鲨鱼模式：进入副本已判定为%s，退出并准备下一轮。",
+                    "普通 Boss" if entry_target is False else "未知目标",
+                )
+                continue
+            self.travel_to_dark_boss()
+            dark_boss_runs += 1
+            logging.info(
+                "确认暗黑鲨鱼，开始实际战斗；进入副本 %s 次，实际战斗暗黑鲨鱼 %s 次。",
+                entered_runs,
+                dark_boss_runs,
+            )
             self.switch_weapon("boss")
             boss_defeated = self.fight_boss()
             if self.stopped:
                 return
             if boss_defeated:
                 self.pickup_and_exit()
+                self.remount_after_dark_dungeon_exit()
                 completed_runs += 1
                 logging.info("只刷副本模式已完成 %s 次。", completed_runs)
             else:
                 self.exit_dungeon()
+                self.remount_after_dark_dungeon_exit()
                 logging.warning("只刷副本模式本次 BOSS 超时，已退出并准备下一轮。")
+
+    def dark_boss_hp_route_test(self, cycles: int = 0) -> None:
+        """只读验证：入副本读一次 HP，仍走到 Boss 点截图，不进行战斗。"""
+        test_root = APP_DIR / "TMP" / "暗黑鲨鱼HP测试"
+        run_dir = test_root / time.strftime("%Y%m%d_%H%M%S")
+        run_dir.mkdir(parents=True, exist_ok=True)
+        logging.info("暗黑鲨鱼 HP 路线测试开始，截图目录：%s。", run_dir)
+        count = 0
+        self._dark_shark_mounted = False
+        while not self.stopped and (cycles <= 0 or count < cycles):
+            self.travel_to_first_entrance_dark()
+            self.enter_dungeon()
+            count += 1
+            hp = self.read_runtime_boss_hp(
+                max(
+                    0.5,
+                    float(
+                        self.cfg.get("dark_boss", {}).get(
+                            "entry_runtime_hp_timeout_seconds", 3.0
+                        )
+                    ),
+                ),
+                "测试入口",
+            )
+            hp_name = "NONE" if hp is None else str(hp)
+
+            normal_hp = int(
+                self.cfg.get("dark_boss", {}).get("normal_max_hp", 18000)
+            )
+            if hp == normal_hp:
+                logging.info(
+                    "暗黑鲨鱼 HP 路线测试第 %s 次：入口读到普通鲨鱼 HP=%s，快速跳过 Boss 路线。",
+                    count,
+                    hp,
+                )
+                self.dismount_before_dark_dungeon_exit()
+                self.exit_dungeon()
+                self.remount_after_dark_dungeon_exit()
+                continue
+
+            if hp is None:
+                logging.info(
+                    "暗黑鲨鱼 HP 路线测试第 %s 次：入口 HP=NONE，按当前实测规则继续暗黑鲨鱼路线。",
+                    count,
+                )
+            else:
+                logging.info(
+                    "暗黑鲨鱼 HP 路线测试第 %s 次：入口 HP=%s，不是普通鲨鱼，继续目标路线。",
+                    count,
+                    hp,
+                )
+            self.travel_to_dark_boss(probe_at_end=False)
+            frame = self.capture_frame()
+            image_path = run_dir / f"{count:04d}_{hp_name}.png"
+            try:
+                encoded_ok, encoded = cv2.imencode(".png", frame)
+                if not encoded_ok:
+                    raise RuntimeError("PNG 编码失败")
+                image_path.write_bytes(encoded.tobytes())
+            except Exception as exc:
+                raise RuntimeError(f"无法保存测试截图：{image_path}（{exc}）") from exc
+            logging.info(
+                "暗黑鲨鱼 HP 路线测试第 %s 次：入口 HP=%s，已到达 Boss 点并保存截图 %s。",
+                count,
+                hp_name,
+                image_path,
+            )
+            if hp is None:
+                # NONE 按当前测试结论视为暗黑鲨鱼，沿用正式攻击流程；
+                # 到达 Boss 点后不得提前退出，必须等待 fight_boss() 确认死亡，
+                # 再拾取掉落并退出副本；不再重复读 HP。
+                logging.info(
+                    "入口 HP=NONE：保持暗黑鲨鱼完整流程，等待 Boss 死亡后拾取再退出。"
+                )
+                self.start_dark_boss_probe()
+                self.switch_weapon("boss")
+                boss_defeated = self.fight_boss()
+                if self.stopped:
+                    return
+                if boss_defeated:
+                    self.pickup_and_exit()
+                else:
+                    self.exit_dungeon()
+                self.remount_after_dark_dungeon_exit()
+            else:
+                # 其他非普通值只做路线验证，不攻击，避免把未知值直接当作目标开战。
+                self.dismount_before_dark_dungeon_exit()
+                self.exit_dungeon()
+                self.remount_after_dark_dungeon_exit()
+        logging.info("暗黑鲨鱼 HP 路线测试结束，共完成 %s 次。", count)
 
     def run(self) -> None:
         required = [
@@ -2343,6 +2775,32 @@ def calibrate_farm_marker(cfg: dict) -> None:
     print(
         f"刷怪点已记录：客户区 ({cx}, {cy})，"
         f"配置 {cfg['coordinates']['farm_spot_marker']}"
+    )
+
+
+def calibrate_dark_boss_path(cfg: dict) -> None:
+    """只记录暗黑鲨鱼模式的副本 Boss 目标点，不修改通用 Boss 点。"""
+    window = GameWindow(cfg["window_title"])
+    window.locate()
+    w, h = window.client_size()
+    print(f"找到游戏客户区：{w}x{h}")
+    print("请先进入副本并打开副本大地图。")
+    print("把鼠标放到暗黑鲨鱼 Boss 的地图目标点；请选择你认为最短的目标路线，然后按 F2。")
+    print("副本内路线不会按 F 骑乘，校准过程不会自动点击；按 F12 取消。")
+    winsound.Beep(750, 120)
+    if not wait_key_edge(VK["F2"]):
+        print("已取消暗黑鲨鱼 Boss 路径校准。")
+        return
+    sx, sy = win32api.GetCursorPos()
+    cx, cy = win32gui.ScreenToClient(window.hwnd, (sx, sy))
+    if not (0 <= cx < w and 0 <= cy < h):
+        raise RuntimeError(f"记录点 ({cx}, {cy}) 不在游戏客户区内，请重新运行校准。")
+    cfg["coordinates"]["dark_boss_marker"] = window.client_to_normalized((cx, cy))
+    save_config(cfg)
+    winsound.Beep(1000, 250)
+    print(
+        f"暗黑鲨鱼 Boss 路径点已记录：客户区 ({cx}, {cy})，"
+        f"配置 {cfg['coordinates']['dark_boss_marker']}"
     )
 
 
@@ -2668,6 +3126,11 @@ def main() -> int:
     parser.add_argument("--calibrate-map", action="store_true", help="只重新校准右上角小地图")
     parser.add_argument("--calibrate-farm", action="store_true", help="只校准疲劳恢复后的刷怪返回点")
     parser.add_argument(
+        "--calibrate-dark-boss-path",
+        action="store_true",
+        help="只校准暗黑鲨鱼模式的副本 Boss 目标点",
+    )
+    parser.add_argument(
         "--calibrate-inventory",
         action="store_true",
         help="单独校准换武器、药品拖拽和杂货铺坐标",
@@ -2685,6 +3148,17 @@ def main() -> int:
         "--full-smoke-test",
         action="store_true",
         help="用临时快速阈值真实执行至少两轮完整疲劳闭环",
+    )
+    parser.add_argument(
+        "--dark-boss-hp-test",
+        action="store_true",
+        help="只读验证暗黑鲨鱼 HP 与路线；每轮只读一次并在 Boss 点截图",
+    )
+    parser.add_argument(
+        "--test-cycles",
+        type=int,
+        default=0,
+        help="HP 路线测试次数；0 表示持续运行，直到按 F12",
     )
     parser.add_argument(
         "--smoke-cycles",
@@ -2733,6 +3207,9 @@ def main() -> int:
     if args.calibrate_farm:
         calibrate_farm_marker(cfg)
         return 0
+    if args.calibrate_dark_boss_path:
+        calibrate_dark_boss_path(cfg)
+        return 0
     if args.calibrate_inventory:
         calibrate_inventory(cfg)
         return 0
@@ -2753,6 +3230,17 @@ def main() -> int:
     instance_mutex = win32event.CreateMutex(None, False, "Local\\CuriousBeastAutomationMVP")
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         raise RuntimeError("已有一个挂机脚本正在运行，请先按 F12 关闭旧实例。")
+    if args.dark_boss_hp_test:
+        if not args.live:
+            raise RuntimeError("暗黑鲨鱼 HP 路线测试会真实控制游戏，必须同时传入 --live。")
+        bot = Bot(cfg, live=True, mode="dungeon")
+        bot.running = True
+        try:
+            bot.dark_boss_hp_route_test(cycles=max(0, args.test_cycles))
+        finally:
+            bot.close()
+            win32api.CloseHandle(instance_mutex)
+        return 0
     mode = args.mode
     if mode is None:
         minimum_runs = max(

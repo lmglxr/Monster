@@ -1,0 +1,36 @@
+{
+  "_comment": "只刷暗黑鲨鱼专用覆盖配置。只刷副本.bat 自动加载；完整挂机和普通启动不受影响。",
+  "dark_boss": {
+    "enabled": true,
+    "identification_mode": "runtime_hp",
+    "dark_max_hp": 26000,
+    "normal_max_hp": 18000,
+    "entry_runtime_hp_timeout_seconds": 3.0,
+    "boss_runtime_hp_timeout_seconds": 6.0,
+    "match_threshold": 0.80,
+    "confirm_samples": 3,
+    "required_hits": 2,
+    "sample_interval_seconds": 0.25
+  },
+  "dark_boss_path": {
+    "_comment": "进入副本后保持骑乘到达 Boss 点；到达终点按 A 自动下坐骑并触发攻击，出副本后再按一次 F 恢复骑乘。",
+    "mount_enabled": true,
+    "mount_key": "F",
+    "remount_after_exit": true,
+    "mount_toggle_settle_seconds": 0.4,
+    "boss_probe_attack_settle_seconds": 0.5,
+    "use_dedicated_marker": true
+  },
+  "timing": {
+    "_comment": "暗黑鲨鱼模式按副本重复速度单独缩短；如果出现界面尚未加载就被点击，逐项增加对应数值。",
+    "map_open_seconds": 0.15,
+    "normal_auto_path_seconds": 3.0,
+    "dungeon_load_seconds": 1.5,
+    "boss_auto_path_seconds": 11.0,
+    "dark_boss_auto_path_seconds": 11.0,
+    "exit_load_seconds": 1.5,
+    "panel_wait_seconds": 0.3,
+    "circle_click_interval_seconds": 0.25,
+    "combat_input_quiet_seconds": 0.15
+  }
+}

@@ -8,7 +8,7 @@
   ],
   "_reference_client_size_comment": "录制模板和入口绕圈半径时使用的客户区基准尺寸，格式为 [宽, 高]，单位为像素。普通坐标已归一化，通常不需要随分辨率修改此项。",
   "window_control": {
-    "_comment": "v0.0.2 窗口捕获和输入策略。焦点脉冲不是完全无感的真后台输入：每次按键或点击会短暂把游戏切到前台，完成后恢复原窗口与鼠标；游戏可被其他窗口遮挡，但不要最小化、锁屏或让电脑睡眠。",
+    "_comment": "v0.0.3 窗口捕获和输入策略。焦点脉冲不是完全无感的真后台输入：每次按键或点击会短暂把游戏切到前台，完成后恢复原窗口与鼠标；游戏可被其他窗口遮挡，但不要最小化、锁屏或让电脑睡眠。",
     "input_mode": "focus_pulse",
     "_input_mode_comment": "输入模式。focus_pulse=需要输入时短暂切到游戏并恢复，允许平时使用其他窗口；foreground_only=旧版行为，游戏不在前台时暂停输入。连续战斗会频繁产生很短的焦点切换，可能影响同时打字。",
     "capture_mode": "print_window",
@@ -87,6 +87,11 @@
       0.302222
     ],
     "_dungeon_boss_marker_comment": "副本大地图上的 BOSS 目标点，点击后角色会自动寻路。",
+    "dark_boss_marker": [
+      0.546875,
+      0.356944
+    ],
+    "_dark_boss_marker_comment": "只刷暗黑鲨鱼模式专用的副本 Boss 路径点。留空时回退使用 dungeon_boss_marker；可运行‘校准暗黑鲨鱼Boss路径.bat’单独记录。",
     "exit_dungeon_button": [
       0.83125,
       0.166667
@@ -238,6 +243,27 @@
     "_normal_scene_id_comment": "普通挂机区域的场景 ID。",
     "boss_scene_id_is_dynamic": true,
     "_boss_scene_id_is_dynamic_comment": "true 表示副本实例的场景 ID 每次进入都可能变化，因此不使用固定 ID 判断；当前脚本按此模式设计。"
+  },
+  "dark_boss": {
+    "_comment": "只刷副本模式的目标过滤。进入副本并寻路到 BOSS 后，只有识别到暗黑鲨鱼才开始战斗。",
+    "enabled": true,
+    "identification_mode": "runtime_hp",
+    "dark_max_hp": 26000,
+    "normal_max_hp": 18000,
+  "entry_runtime_hp_timeout_seconds": 3.0,
+  "boss_runtime_hp_timeout_seconds": 6.0,
+    "_enabled_comment": "仅影响只刷副本.bat；完整闭环仍按原逻辑刷普通 BOSS。",
+    "match_threshold": 0.8,
+    "_match_threshold_comment": "暗黑鲨鱼模板匹配阈值。当前默认 0.80，优先避免把普通 BOSS 误判为暗黑鲨鱼。",
+    "confirm_samples": 3,
+    "required_hits": 2,
+    "sample_interval_seconds": 0.35,
+    "search_region": [
+      0.12,
+      0.1,
+      0.88,
+      0.9
+    ]
   },
   "timing": {
     "_comment": "界面、寻路、加载和战斗各阶段的等待时间，单位均为秒。网络或电脑较慢时可适当增大，过短容易在界面尚未就绪时误操作。",

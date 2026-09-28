@@ -28,6 +28,23 @@ const monoClassGetFieldFromName = monoFn(
   "pointer",
   ["pointer", "pointer"]
 );
+const monoClassGetParent = monoFn(
+  "mono_class_get_parent",
+  "pointer",
+  ["pointer"]
+);
+const monoClassGetFields = monoFn(
+  "mono_class_get_fields",
+  "pointer",
+  ["pointer", "pointer"]
+);
+const monoFieldGetName = monoFn("mono_field_get_name", "pointer", ["pointer"]);
+const monoClassGetMethods = monoFn(
+  "mono_class_get_methods",
+  "pointer",
+  ["pointer", "pointer"]
+);
+const monoMethodGetName = monoFn("mono_method_get_name", "pointer", ["pointer"]);
 const monoFieldGetValue = monoFn(
   "mono_field_get_value",
   "void",
@@ -67,6 +84,7 @@ function utf8(value) {
 
 const objects = new Map();
 const bossEntityIds = new Set();
+let bossMonsterObject = null;
 let hookCount = 0;
 
 function stateFor(objectPointer) {
@@ -198,6 +216,135 @@ hookSetter("HuntFatigueSync", "set_HuntFatigue", (objectPointer, value) => {
 const monsterClass = findClass("CreatureCurios", "Monster");
 const monsterIdField = monoClassGetFieldFromName(monsterClass, utf8("m_monsterId"));
 if (monsterIdField.isNull()) throw new Error("CreatureCurios.Monster.m_monsterId not found");
+
+// HP is declared on a base class in some builds. mono_class_get_field_from_name
+// does not reliably return inherited fields, so walk the complete class chain.
+function findFieldInHierarchy(klass, fieldName) {
+  let current = klass;
+  while (!current.isNull()) {
+    const field = monoClassGetFieldFromName(current, utf8(fieldName));
+    if (!field.isNull()) return field;
+    current = monoClassGetParent(current);
+  }
+  return ptr(0);
+}
+
+function findMethodInHierarchy(klass, methodName, parameterCount) {
+  let current = klass;
+  while (!current.isNull()) {
+    const method = monoClassGetMethodFromName(
+      current,
+      utf8(methodName),
+      parameterCount
+    );
+    if (!method.isNull()) {
+      const compiled = monoCompileMethod(method);
+      if (!compiled.isNull()) return compiled;
+    }
+    current = monoClassGetParent(current);
+  }
+  throw new Error(`CreatureCurios.Monster.${methodName} not found in hierarchy`);
+}
+
+const monsterHpField = findFieldInHierarchy(monsterClass, "m_HP");
+const monsterMaxHpField = findFieldInHierarchy(monsterClass, "m_MaxHP");
+
+function collectMonsterHpCandidates(klass) {
+  const candidates = [];
+  let current = klass;
+  while (!current.isNull()) {
+    const fieldIterator = Memory.alloc(Process.pointerSize);
+    fieldIterator.writePointer(ptr(0));
+    while (true) {
+      const field = monoClassGetFields(current, fieldIterator);
+      if (field.isNull()) break;
+      const namePointer = monoFieldGetName(field);
+      if (!namePointer.isNull()) {
+        const name = namePointer.readUtf8String();
+        if (/hp|health|血|cur|max/i.test(name)) candidates.push(`field:${name}`);
+      }
+    }
+    const methodIterator = Memory.alloc(Process.pointerSize);
+    methodIterator.writePointer(ptr(0));
+    while (true) {
+      const method = monoClassGetMethods(current, methodIterator);
+      if (method.isNull()) break;
+      const namePointer = monoMethodGetName(method);
+      if (!namePointer.isNull()) {
+        const name = namePointer.readUtf8String();
+        if (/hp|health|血|cur|max/i.test(name)) candidates.push(`method:${name}`);
+      }
+    }
+    current = monoClassGetParent(current);
+  }
+  return Array.from(new Set(candidates));
+}
+
+// Some builds expose HP only through methods, even though the assembly still
+// contains the old field names in metadata. Prefer the methods when present.
+let monsterGetHp = null;
+let monsterGetMaxHp = null;
+try {
+  monsterGetHp = new NativeFunction(
+    findMethodInHierarchy(monsterClass, "GetCurHp", -1),
+    "int",
+    ["pointer"]
+  );
+} catch (error) {
+  send({ type: "probe_diagnostic", get_cur_hp_error: String(error) });
+}
+try {
+  monsterGetMaxHp = new NativeFunction(
+    findMethodInHierarchy(monsterClass, "GetMaxHp", -1),
+    "int",
+    ["pointer"]
+  );
+} catch (error) {
+  send({ type: "probe_diagnostic", get_max_hp_error: String(error) });
+}
+
+send({
+  type: "probe_diagnostic",
+  monster_hp_field_found: !monsterHpField.isNull(),
+  monster_max_hp_field_found: !monsterMaxHpField.isNull(),
+  get_cur_hp_found: monsterGetHp !== null,
+  get_max_hp_found: monsterGetMaxHp !== null,
+  monster_hp_candidates: collectMonsterHpCandidates(monsterClass)
+});
+
+function readIntField(objectPointer, field) {
+  if (field.isNull()) return undefined;
+  const valueBuffer = Memory.alloc(4);
+  monoFieldGetValue(objectPointer, field, valueBuffer);
+  return valueBuffer.readS32();
+}
+
+function emitBossRuntimeHp(objectPointer, source) {
+  try {
+    const monsterId = readIntField(objectPointer, monsterIdField);
+    if (monsterId !== bossMonsterId) return;
+    const hp = monsterGetHp !== null
+      ? monsterGetHp(objectPointer)
+      : readIntField(objectPointer, monsterHpField);
+    const maxHp = monsterGetMaxHp !== null
+      ? monsterGetMaxHp(objectPointer)
+      : readIntField(objectPointer, monsterMaxHpField);
+    if (hp === undefined && maxHp === undefined) return;
+    send({
+      type: "boss_hp",
+      source: source,
+      monster_id: monsterId,
+      hp: hp,
+      max_hp: maxHp
+    });
+  } catch (error) {
+    // The managed object may already have been destroyed after leaving a
+    // dungeon. Stop polling this stale pointer until the next OnShow event.
+    bossMonsterObject = null;
+    send({ type: "probe_warning", error: `Monster HP read: ${error}` });
+  }
+}
+
 const monsterOnDead = findMethod("CreatureCurios", "Monster", "OnDead", -1);
 Interceptor.attach(monsterOnDead, {
   onEnter(args) {
@@ -230,11 +377,13 @@ Interceptor.attach(monsterOnShow, {
       monoFieldGetValue(this.monsterObject, monsterIdField, valueBuffer);
       const monsterId = valueBuffer.readS32();
       if (monsterId === bossMonsterId) {
+        bossMonsterObject = this.monsterObject;
         send({
           type: "boss_seen",
           source: "Monster.OnShow",
           monster_id: monsterId
         });
+        emitBossRuntimeHp(this.monsterObject, "Monster.OnShow.fields");
       }
     } catch (error) {
       send({ type: "probe_warning", error: `Monster.OnShow: ${error}` });
@@ -245,6 +394,15 @@ Interceptor.attach(monsterOnShow, {
   }
 });
 hookCount += 1;
+
+// The current game build initializes m_HP/m_MaxHP after OnShow. Poll the
+// managed fields briefly and emit changes so the Python side can classify the
+// boss even when the protobuf CurHp setter is bypassed.
+setInterval(() => {
+  if (bossMonsterObject !== null) {
+    emitBossRuntimeHp(bossMonsterObject, "Monster.fields.poll");
+  }
+}, 100);
 
 // MainHUDForm starts a compiler-generated coroutine with the exact fatigue
 // target. Reading its managed field avoids OCR and does not depend on protobuf

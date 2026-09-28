@@ -20,11 +20,15 @@ class MonoRuntimeProbe:
         self.boss_dead = False
         self.death_source: Optional[str] = None
         self.latest_hp: Optional[int] = None
+        self.latest_max_hp: Optional[int] = None
         self.latest_fatigue: Optional[int] = None
         self.fatigue_revision = 0
         self._ready_at: Optional[float] = None
         self._fatigue_updated_at: Optional[float] = None
         self._last_logged_fatigue: Optional[int] = None
+        self._last_logged_boss_hp: Optional[tuple[int, int]] = None
+        self._last_boss_hp_log_at = 0.0
+        self._monster_death_log_state: dict[int, tuple[float, int]] = {}
         self.last_error: Optional[str] = None
         self._lock = threading.Lock()
         self._session: Any = None
@@ -104,6 +108,39 @@ class MonoRuntimeProbe:
                 if payload.get("hp") is not None:
                     self.latest_hp = int(payload["hp"])
                 logging.info("Mono 运行时收到 BOSS 死亡事件：%s", self.death_source)
+            elif kind == "boss_hp":
+                if payload.get("hp") is not None:
+                    self.latest_hp = int(payload["hp"])
+                if payload.get("max_hp") is not None:
+                    self.latest_max_hp = int(payload["max_hp"])
+                hp_pair = (self.latest_hp, self.latest_max_hp)
+                now = time.monotonic()
+                if (
+                    hp_pair != self._last_logged_boss_hp
+                    or now - self._last_boss_hp_log_at >= 5.0
+                ):
+                    logging.info(
+                        "Mono Boss HP 更新：当前=%s，最大=%s（%s）。",
+                        self.latest_hp,
+                        self.latest_max_hp,
+                        payload.get("source", "runtime"),
+                    )
+                    self._last_logged_boss_hp = hp_pair
+                    self._last_boss_hp_log_at = now
+            elif kind == "probe_diagnostic":
+                if "monster_hp_field_found" in payload:
+                    logging.info(
+                        "Mono HP 入口诊断：字段 m_HP=%s，字段 m_MaxHP=%s，"
+                        "GetCurHp=%s，GetMaxHp=%s。",
+                        payload.get("monster_hp_field_found"),
+                        payload.get("monster_max_hp_field_found"),
+                        payload.get("get_cur_hp_found"),
+                        payload.get("get_max_hp_found"),
+                    )
+                    candidates = payload.get("monster_hp_candidates") or []
+                    logging.info("Mono Monster HP 候选入口：%s。", ", ".join(candidates) or "未找到")
+                else:
+                    logging.warning("Mono HP 方法诊断：%s", payload)
             elif kind == "fatigue":
                 value = int(payload["value"])
                 if value != self.latest_fatigue:
@@ -126,8 +163,21 @@ class MonoRuntimeProbe:
                         self._last_logged_fatigue = value
             elif kind == "monster_dead_observed":
                 monster_id = int(payload.get("monster_id", 0))
-                log = logging.debug if monster_id in {10008, 10010, 10011} else logging.info
-                log("Mono 运行时观察到怪物死亡：MonsterId=%s。", monster_id)
+                now = time.monotonic()
+                last_at, count = self._monster_death_log_state.get(
+                    monster_id, (0.0, 0)
+                )
+                count += 1
+                # 小怪死亡只保留首条和每 30 秒一次的累计摘要，所有模式共用。
+                if now - last_at >= 30.0:
+                    logging.info(
+                        "Mono 运行时小怪死亡汇总：MonsterId=%s，最近累计 %s 次。",
+                        monster_id,
+                        count,
+                    )
+                    self._monster_death_log_state[monster_id] = (now, 0)
+                else:
+                    self._monster_death_log_state[monster_id] = (last_at, count)
             elif kind in {"probe_error", "probe_warning"}:
                 self.last_error = str(payload.get("error", payload))
                 logging.warning("Mono 运行时探针：%s", self.last_error)
@@ -138,6 +188,7 @@ class MonoRuntimeProbe:
             self.boss_dead = False
             self.death_source = None
             self.latest_hp = None
+            self.latest_max_hp = None
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -148,6 +199,7 @@ class MonoRuntimeProbe:
                 "boss_dead": self.boss_dead,
                 "death_source": self.death_source,
                 "latest_hp": self.latest_hp,
+                "latest_max_hp": self.latest_max_hp,
                 "latest_fatigue": self.latest_fatigue,
                 "fatigue_revision": self.fatigue_revision,
                 "ready_age_seconds": (
