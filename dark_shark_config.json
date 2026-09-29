@@ -7,6 +7,7 @@
     "normal_max_hp": 18000,
     "entry_runtime_hp_timeout_seconds": 3.0,
     "boss_runtime_hp_timeout_seconds": 6.0,
+    "boss_fatigue_gain_threshold": 80,
     "match_threshold": 0.80,
     "confirm_samples": 3,
     "required_hits": 2,

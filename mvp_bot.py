@@ -2062,6 +2062,77 @@ class Bot:
         self.click("enter_dungeon_button")
         self.wait(self.cfg["timing"]["dungeon_load_seconds"])
 
+    def enter_dungeon_with_exit_recovery(self) -> bool:
+        """进入失败且上一轮声称已退出时，反向验证并补做退出。"""
+        try:
+            self.enter_dungeon()
+            return True
+        except RuntimeError as exc:
+            if not self._dungeon_exit_started:
+                raise
+            logging.warning(
+                "下一轮副本入口未找到，说明上一轮可能未真正退出；"
+                "重新执行退出副本确认：%s",
+                exc,
+            )
+            self._dungeon_exit_started = False
+            self.exit_dungeon()
+            return False
+
+    def wait_for_scene(
+        self,
+        expected: str,
+        timeout: float,
+        *,
+        runtime_scene_revision: Optional[int] = None,
+        log_scene_revision: Optional[int] = None,
+    ) -> bool:
+        """等待真实场景来源确认目标场景；phase 本身不参与确认。"""
+        normal_scene = int(self.cfg.get("scenes", {}).get("normal_scene_id", 1002))
+        runtime_start = (
+            runtime_scene_revision
+            if runtime_scene_revision is not None
+            else (
+                self.runtime_probe.snapshot().get("scene_revision", 0)
+                if self.runtime_probe is not None
+                else 0
+            )
+        )
+        log_start = (
+            log_scene_revision
+            if log_scene_revision is not None
+            else self.log_tail.scene_revision
+        )
+        deadline = time.monotonic() + max(0.5, float(timeout))
+        while time.monotonic() < deadline and not self.stopped:
+            self.log_tail.poll()
+            if self.runtime_probe is not None:
+                snapshot = self.runtime_probe.snapshot()
+                if snapshot.get("scene_revision", 0) > runtime_start:
+                    scene_id = snapshot.get("latest_scene_id")
+                    if scene_id is not None:
+                        is_normal = int(scene_id) == normal_scene
+                        if (expected == "normal") == is_normal:
+                            logging.info(
+                                "Mono 已确认当前场景：%s（SceneId=%s）。",
+                                "普通场景" if is_normal else "副本场景",
+                                scene_id,
+                            )
+                            return True
+            if self.log_tail.scene_revision > log_start:
+                scene_id = self.log_tail.latest_scene
+                if scene_id is not None:
+                    is_normal = int(scene_id) == normal_scene
+                    if (expected == "normal") == is_normal:
+                        logging.info(
+                            "日志已确认当前场景：%s（SceneId=%s）。",
+                            "普通场景" if is_normal else "副本场景",
+                            scene_id,
+                        )
+                        return True
+            self.wait(0.1)
+        return False
+
     def wait_navigation_with_mount(
         self,
         total_seconds: float,
@@ -2276,6 +2347,8 @@ class Bot:
             logging.info("尚无战前疲劳基准，先读取一次用于 BOSS 死亡兜底判断。")
             fatigue_baseline = self.read_fatigue(attempts=3, refresh_rounds=1)
         runtime_fatigue_baseline = runtime_snapshot.get("latest_fatigue")
+        if runtime_fatigue_baseline is not None:
+            runtime_fatigue_baseline = int(runtime_fatigue_baseline)
         fatigue_probe_delay = max(
             1.0,
             float(combat_cfg.get("boss_fatigue_probe_initial_delay_seconds", 12.0)),
@@ -2288,6 +2361,21 @@ class Bot:
             1,
             int(combat_cfg.get("boss_fatigue_gain_threshold", 40)),
         )
+        if self.mode == "dungeon":
+            # 黑鲨模式的 Mono HP 经常是 None，使用更保守的疲劳增量作为
+            # 击杀兜底，避免误判后过早退出。普通挂机保持原有阈值。
+            fatigue_gain_threshold = max(
+                1,
+                int(
+                    self.cfg.get("dark_boss", {}).get(
+                        "boss_fatigue_gain_threshold", 80
+                    )
+                ),
+            )
+            logging.info(
+                "暗黑鲨鱼模式疲劳增量兜底阈值：%s。",
+                fatigue_gain_threshold,
+            )
         next_fatigue_probe = time.monotonic() + fatigue_probe_delay
         deadline = time.monotonic() + self.cfg["timing"]["boss_timeout_seconds"]
         revive_epoch = self.revive_epoch
@@ -2316,20 +2404,26 @@ class Bot:
                     logging.info("Mono 运行时读取 Boss 当前 HP=0，确认 BOSS 已死亡。")
                     return True
                 runtime_fatigue = runtime_snapshot.get("latest_fatigue")
-                if (
-                    runtime_snapshot.get("boss_seen")
-                    and runtime_fatigue_baseline is not None
-                    and runtime_fatigue is not None
-                    and int(runtime_fatigue) - int(runtime_fatigue_baseline)
-                    >= fatigue_gain_threshold
-                ):
-                    logging.info(
-                        "Mono 运行时已识别目标 BOSS，且 HuntFatigueSyncEvent 从 %s "
-                        "恢复到 %s；确认 BOSS 已死亡。",
-                        runtime_fatigue_baseline,
-                        runtime_fatigue,
-                    )
-                    return True
+                if runtime_fatigue is not None:
+                    runtime_fatigue = int(runtime_fatigue)
+                    if runtime_fatigue_baseline is None:
+                        # 探针可能在进入副本后才收到第一条疲劳更新；
+                        # 第一条只建立基准，避免把旧值/首条值误算成击杀。
+                        runtime_fatigue_baseline = runtime_fatigue
+                        logging.info(
+                            "已建立本场 Boss 疲劳基准：%s，等待后续疲劳更新。",
+                            runtime_fatigue_baseline,
+                        )
+                    elif runtime_fatigue - runtime_fatigue_baseline >= fatigue_gain_threshold:
+                        logging.info(
+                            "HuntFatigueSyncEvent 从 %s "
+                            "恢复到 %s（增量 %s，阈值 %s）；确认 BOSS 已死亡。",
+                            runtime_fatigue_baseline,
+                            runtime_fatigue,
+                            runtime_fatigue - runtime_fatigue_baseline,
+                            fatigue_gain_threshold,
+                        )
+                        return True
             self.log_tail.poll()
             if log_detection_enabled and self.log_tail.boss_seen:
                 logging.info("日志已识别 BOSS 实体 %s。", self.cfg["combat"]["boss_entity_id"])
@@ -2423,15 +2517,53 @@ class Bot:
             return
         logging.info("状态：退出副本。")
         self.set_phase("exiting_dungeon")
-        attempts = 2
+        timing_cfg = self.cfg.get("timing", {})
+        attempts = max(1, int(timing_cfg.get("exit_click_attempts", 3)))
+        confirm_settle = max(
+            0.8, float(timing_cfg.get("exit_confirm_settle_seconds", 1.2))
+        )
+        exit_load = max(1.5, float(timing_cfg.get("exit_load_seconds", 3.0)))
+        scene_timeout = max(
+            2.0,
+            float(timing_cfg.get("scene_transition_timeout_seconds", 8.0)),
+        )
         for attempt in range(1, attempts + 1):
             try:
-                logging.info("执行退出副本点击流程（第 %s/%s 次）。", attempt, attempts)
+                runtime_scene_revision = (
+                    self.runtime_probe.snapshot().get("scene_revision", 0)
+                    if self.runtime_probe is not None
+                    else 0
+                )
+                log_scene_revision = self.log_tail.scene_revision
+                logging.info(
+                    "执行退出副本点击流程（第 %s/%s 次，确认框等待 %.1f 秒，"
+                    "退出加载等待 %.1f 秒，场景确认最多 %.1f 秒）。",
+                    attempt,
+                    attempts,
+                    confirm_settle,
+                    exit_load,
+                    scene_timeout,
+                )
                 self.click("exit_dungeon_button")
-                self.wait(0.8)
+                if not self.wait(confirm_settle):
+                    return
                 self.click("confirm_exit_button")
-                self.wait(self.cfg["timing"]["exit_load_seconds"])
+                if not self.wait(exit_load):
+                    return
+                if not self.wait_for_scene(
+                    "normal",
+                    scene_timeout,
+                    runtime_scene_revision=runtime_scene_revision,
+                    log_scene_revision=log_scene_revision,
+                ):
+                    logging.warning(
+                        "第 %s 次退出点击后未确认已回到普通场景，将重试；"
+                        "不会进入下一轮。",
+                        attempt,
+                    )
+                    continue
                 self._dungeon_exit_started = True
+                logging.info("已确认退出副本并回到普通场景，开始下一轮前置流程。")
                 return
             except Exception:
                 if attempt >= attempts:
@@ -2439,6 +2571,9 @@ class Bot:
                     logging.exception("退出副本点击流程失败。")
                     raise
                 logging.exception("退出副本点击流程第 %s 次失败，准备重试。", attempt)
+        raise RuntimeError(
+            "退出副本点击后未收到普通场景确认，已停止本轮，避免在副本内错进入下一轮。"
+        )
 
     def boss_recovery_loop(self) -> None:
         completed_runs = 0
@@ -2446,7 +2581,8 @@ class Bot:
         while not self.stopped:
             # 每次退出都会回到普通地图，因此每一轮都重新用地图寻路到入口。
             self.travel_to_first_entrance()
-            self.enter_dungeon()
+            if not self.enter_dungeon_with_exit_recovery():
+                continue
             self.travel_to_boss()
             self.switch_weapon("boss")
             boss_defeated = self.fight_boss()
@@ -2517,7 +2653,8 @@ class Bot:
         self._dark_shark_mounted = False
         while not self.stopped:
             self.travel_to_first_entrance_dark()
-            self.enter_dungeon()
+            if not self.enter_dungeon_with_exit_recovery():
+                continue
             entered_runs += 1
             logging.info(
                 "只刷暗黑鲨鱼统计：进入副本 %s 次，实际战斗暗黑鲨鱼 %s 次。",
@@ -2571,7 +2708,8 @@ class Bot:
         self._dark_shark_mounted = False
         while not self.stopped and (cycles <= 0 or count < cycles):
             self.travel_to_first_entrance_dark()
-            self.enter_dungeon()
+            if not self.enter_dungeon_with_exit_recovery():
+                continue
             count += 1
             hp = self.read_runtime_boss_hp(
                 max(

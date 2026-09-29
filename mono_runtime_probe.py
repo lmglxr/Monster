@@ -22,6 +22,8 @@ class MonoRuntimeProbe:
         self.latest_hp: Optional[int] = None
         self.latest_max_hp: Optional[int] = None
         self.latest_fatigue: Optional[int] = None
+        self.latest_scene_id: Optional[int] = None
+        self.scene_revision = 0
         self.fatigue_revision = 0
         self._ready_at: Optional[float] = None
         self._fatigue_updated_at: Optional[float] = None
@@ -141,6 +143,8 @@ class MonoRuntimeProbe:
                     )
                     candidates = payload.get("monster_hp_candidates") or []
                     logging.info("Mono Monster HP 候选入口：%s。", ", ".join(candidates) or "未找到")
+                elif payload.get("scene_hook"):
+                    logging.info("Mono 场景入口已挂钩：%s。", payload["scene_hook"])
                 else:
                     logging.warning("Mono HP 方法诊断：%s", payload)
             elif kind == "fatigue":
@@ -149,6 +153,16 @@ class MonoRuntimeProbe:
                     self.latest_fatigue = value
                     self.fatigue_revision += 1
                     self._fatigue_updated_at = time.monotonic()
+            elif kind == "scene_update":
+                scene_id = payload.get("scene_id")
+                if scene_id is not None:
+                    self.latest_scene_id = int(scene_id)
+                    self.scene_revision += 1
+                    logging.info(
+                        "Mono 运行时场景更新：SceneId=%s（%s）。",
+                        self.latest_scene_id,
+                        payload.get("source", "runtime"),
+                    )
                     # 每次同步都保留在内存中，但不再把每一点变化都
                     # 打到常规日志。首值和大幅变化才记 INFO，其余只记 DEBUG。
                     should_log = (
@@ -203,6 +217,8 @@ class MonoRuntimeProbe:
                 "latest_hp": self.latest_hp,
                 "latest_max_hp": self.latest_max_hp,
                 "latest_fatigue": self.latest_fatigue,
+                "latest_scene_id": self.latest_scene_id,
+                "scene_revision": self.scene_revision,
                 "fatigue_revision": self.fatigue_revision,
                 "ready_age_seconds": (
                     None if self._ready_at is None else now - self._ready_at

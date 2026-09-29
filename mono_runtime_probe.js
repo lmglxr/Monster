@@ -154,6 +154,38 @@ function hookSetter(className, methodName, callback) {
   hookCount += 1;
 }
 
+function tryHookSceneSetter(className, methodName) {
+  try {
+    hookSetter(className, methodName, (objectPointer, value) => {
+      send({
+        type: "scene_update",
+        source: `Protoc.${className}.${methodName}`,
+        scene_id: value
+      });
+    });
+    send({ type: "probe_diagnostic", scene_hook: `Protoc.${className}.${methodName}` });
+  } catch (error) {
+    // Game builds differ in which scene response class they expose. Missing
+    // optional scene fields must not prevent the Boss HP probe from starting.
+  }
+}
+
+// Scene changes are delivered through different protobuf response classes in
+// different builds. Hook the optional scene-id setters when present. The
+// Python side classifies the configured normal scene (1002) separately from a
+// dynamic dungeon scene.
+[
+  "EnterSceneSync",
+  "EnterSceneInnerRsp",
+  "EnterSceneFinishRsp",
+  "SceneChangeRsp",
+  "SceneCreateDungeonInnerRsp"
+].forEach((className) => {
+  ["set_SceneTid", "set_TargetSceneId", "set_SceneId"].forEach((methodName) => {
+    tryHookSceneSetter(className, methodName);
+  });
+});
+
 // SceneEntityBaseInfoSyncEvent payload: correlate the instance entity id,
 // monster configuration id and current HP on the same protobuf object.
 hookSetter("EntityBaseInfo", "set_EntityId", (objectPointer, value) => {

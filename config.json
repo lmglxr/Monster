@@ -159,8 +159,8 @@
     "_boss_fatigue_probe_initial_delay_seconds_comment": "开始攻击后第一次检查疲劳增量前等待的秒数。过小会频繁打断攻击；普通配置建议 10～20 秒。",
     "boss_fatigue_probe_interval_seconds": 4.0,
     "_boss_fatigue_probe_interval_seconds_comment": "第一次检查没有确认击杀时，后续疲劳检查间隔，单位为秒。",
-    "boss_fatigue_gain_threshold": 40,
-    "_boss_fatigue_gain_threshold_comment": "相对战前疲劳值至少增加多少才视为疑似击杀。当前 BOSS 通常恢复约 100 点，设为 40 可容忍 OCR 个位误差，同时不容易误触发。"
+    "boss_fatigue_gain_threshold": 80,
+    "_boss_fatigue_gain_threshold_comment": "所有模式相对本场 Boss 战前的疲劳值至少增加多少才视为 Boss 已死亡。当前统一使用 80，避免 HP/死亡事件缺失时流程中断。"
   },
   "travel_mount": {
     "_comment": "普通世界地图点击目标并开始自动寻路后按 F 骑乘宠物。仅用于去副本入口和返回刷怪点，副本内去 BOSS 点绝不按 F。",
@@ -281,6 +281,12 @@
     "_boss_timeout_seconds_comment": "单场 BOSS 战允许的最长时间。复活后会重新计时；超时且日志仍未确认 BOSS 死亡时，脚本会退出本次副本，重新检查疲劳后继续流程，不会暂停整个挂机任务。",
     "exit_load_seconds": 3.0,
     "_exit_load_seconds_comment": "确认退出副本后等待返回普通区域并完成加载的时间。",
+    "exit_click_attempts": 3,
+    "_exit_click_attempts_comment": "退出按钮和确认按钮整套点击流程的最大重试次数，防止云电脑加载慢或首次点击失效。",
+    "exit_confirm_settle_seconds": 1.2,
+    "_exit_confirm_settle_seconds_comment": "点击退出副本后，等待退出确认框完全出现的时间，单位为秒。",
+    "scene_transition_timeout_seconds": 8.0,
+    "_scene_transition_timeout_seconds_comment": "点击确认退出后等待 Mono/日志确认回到普通场景的最长时间，单位为秒。未确认时不会进入下一轮。",
     "panel_wait_seconds": 0.5,
     "_panel_wait_seconds_comment": "通用面板操作的预留等待时间；当前版本保留此参数，部分流程可能未直接使用。",
     "circle_click_interval_seconds": 0.35,
