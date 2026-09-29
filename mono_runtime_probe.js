@@ -337,6 +337,14 @@ function emitBossRuntimeHp(objectPointer, source) {
       hp: hp,
       max_hp: maxHp
     });
+    if (hp !== undefined && hp <= 0) {
+      send({
+        type: "boss_dead",
+        source: "Monster.GetCurHp",
+        monster_id: monsterId,
+        hp: hp
+      });
+    }
   } catch (error) {
     // The managed object may already have been destroyed after leaving a
     // dungeon. Stop polling this stale pointer until the next OnShow event.

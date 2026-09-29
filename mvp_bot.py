@@ -2484,18 +2484,21 @@ class Bot:
                 dark_boss_runs,
             )
             entry_target = self.classify_dark_boss_after_entry()
-            if entry_target is not True:
+            if entry_target is False:
                 if self.stopped:
                     return
-                if entry_target is False:
-                    self.dismount_before_dark_dungeon_exit()
+                self.dismount_before_dark_dungeon_exit()
                 self.exit_dungeon()
                 self.remount_after_dark_dungeon_exit()
                 logging.info(
-                    "只刷暗黑鲨鱼模式：进入副本已判定为%s，退出并准备下一轮。",
-                    "普通 Boss" if entry_target is False else "未知目标",
+                    "只刷暗黑鲨鱼模式：进入副本已明确判定为普通 Boss，退出并准备下一轮。",
                 )
                 continue
+            if entry_target is None:
+                logging.warning(
+                    "只刷暗黑鲨鱼模式：入口 HP=NONE，按暗黑鲨鱼候选继续；"
+                    "后续只依据 Boss 死亡事件或战斗超时退出。"
+                )
             self.travel_to_dark_boss()
             dark_boss_runs += 1
             logging.info(
