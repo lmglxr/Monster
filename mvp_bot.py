@@ -2224,9 +2224,18 @@ class Bot:
         runtime_snapshot = (
             self.runtime_probe.snapshot() if self.runtime_probe is not None else {}
         )
+        runtime_hp_available = (
+            runtime_snapshot.get("latest_hp") is not None
+            or runtime_snapshot.get("latest_max_hp") is not None
+        )
         runtime_detection_enabled = bool(runtime_snapshot.get("available")) and (
             detection_mode == "runtime_first"
         )
+        if runtime_detection_enabled and not runtime_hp_available:
+            logging.warning(
+                "本轮 Mono 尚未提供 Boss HP；不把 None 当作离开副本，"
+                "改由死亡事件或战斗超时兜底。"
+            )
         log_detection_enabled = detection_mode in {
             "runtime_first",
             "log_first",
@@ -2295,6 +2304,14 @@ class Bot:
                         "Mono 运行时确认 BOSS 已死亡（%s）。",
                         runtime_snapshot.get("death_source"),
                     )
+                    return True
+                runtime_hp = runtime_snapshot.get("latest_hp")
+                if (
+                    runtime_snapshot.get("boss_seen")
+                    and runtime_hp is not None
+                    and int(runtime_hp) <= 0
+                ):
+                    logging.info("Mono 运行时读取 Boss 当前 HP=0，确认 BOSS 已死亡。")
                     return True
                 runtime_fatigue = runtime_snapshot.get("latest_fatigue")
                 if (
