@@ -102,12 +102,14 @@ class MonoRuntimeProbe:
                         payload.get("source", "runtime"),
                     )
             elif kind == "boss_dead":
+                was_dead = self.boss_dead
                 self.boss_seen = True
                 self.boss_dead = True
                 self.death_source = str(payload.get("source", "Mono runtime"))
                 if payload.get("hp") is not None:
                     self.latest_hp = int(payload["hp"])
-                logging.info("Mono 运行时收到 BOSS 死亡事件：%s", self.death_source)
+                if not was_dead:
+                    logging.info("Mono 运行时收到 BOSS 死亡事件：%s", self.death_source)
             elif kind == "boss_hp":
                 if payload.get("hp") is not None:
                     self.latest_hp = int(payload["hp"])

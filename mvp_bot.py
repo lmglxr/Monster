@@ -807,6 +807,7 @@ class Bot:
         # 只刷暗黑鲨鱼模式单独维护骑乘状态，避免出副本已上坐骑后，
         # 下一轮前往入口又按一次 F 反而下坐骑。
         self._dark_shark_mounted = False
+        self._dungeon_exit_started = False
 
     @staticmethod
     def _load_gray_template(name: str) -> Optional[np.ndarray]:
@@ -2052,6 +2053,7 @@ class Bot:
     def enter_dungeon(self) -> None:
         logging.info("状态：触发入口并进入冰牙海湾。")
         self.set_phase("entering_dungeon")
+        self._dungeon_exit_started = False
         if self.runtime_probe is not None:
             # 在新副本实体生成前清除上一轮状态；Boss.OnShow 随后的事件会
             # 重新建立本轮目标，不能等到开战时再把它清掉。
@@ -2400,21 +2402,43 @@ class Bot:
     def pickup_and_exit(self) -> None:
         logging.info("状态：拾取 BOSS 掉落。")
         self.set_phase("boss_loot")
-        self.window.tap_key(
-            self.cfg["combat"]["pickup_key"],
-            hold_seconds=self.cfg["combat"]["boss_pickup_hold_seconds"],
-            live=self.live,
-        )
-        self.wait(1.5)
-        self.exit_dungeon()
+        try:
+            self.window.tap_key(
+                self.cfg["combat"]["pickup_key"],
+                hold_seconds=self.cfg["combat"]["boss_pickup_hold_seconds"],
+                live=self.live,
+            )
+            self.wait(1.5)
+        except Exception as exc:
+            # 拾取不是流程闭环的必要条件；即使拾取输入失败，也必须继续
+            # 执行退出，避免角色停在已结束的副本里。
+            logging.warning("BOSS 掉落拾取失败，仍继续退出副本：%s", exc)
+        finally:
+            if not self.stopped:
+                self.exit_dungeon()
 
     def exit_dungeon(self) -> None:
+        if self._dungeon_exit_started:
+            logging.info("本轮退出副本流程已执行，跳过重复退出请求。")
+            return
         logging.info("状态：退出副本。")
         self.set_phase("exiting_dungeon")
-        self.click("exit_dungeon_button")
-        self.wait(0.8)
-        self.click("confirm_exit_button")
-        self.wait(self.cfg["timing"]["exit_load_seconds"])
+        attempts = 2
+        for attempt in range(1, attempts + 1):
+            try:
+                logging.info("执行退出副本点击流程（第 %s/%s 次）。", attempt, attempts)
+                self.click("exit_dungeon_button")
+                self.wait(0.8)
+                self.click("confirm_exit_button")
+                self.wait(self.cfg["timing"]["exit_load_seconds"])
+                self._dungeon_exit_started = True
+                return
+            except Exception:
+                if attempt >= attempts:
+                    # 允许上层记录真实异常，但不再吞掉退出失败原因。
+                    logging.exception("退出副本点击流程失败。")
+                    raise
+                logging.exception("退出副本点击流程第 %s 次失败，准备重试。", attempt)
 
     def boss_recovery_loop(self) -> None:
         completed_runs = 0

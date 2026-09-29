@@ -321,6 +321,7 @@ function readIntField(objectPointer, field) {
 
 function emitBossRuntimeHp(objectPointer, source) {
   try {
+    const state = stateFor(objectPointer);
     const monsterId = readIntField(objectPointer, monsterIdField);
     if (monsterId !== bossMonsterId) return;
     const hp = monsterGetHp !== null
@@ -338,6 +339,8 @@ function emitBossRuntimeHp(objectPointer, source) {
       max_hp: maxHp
     });
     if (hp !== undefined && hp <= 0) {
+      if (state.bossDeathEmitted) return;
+      state.bossDeathEmitted = true;
       send({
         type: "boss_dead",
         source: "Monster.GetCurHp",
@@ -357,11 +360,14 @@ const monsterOnDead = findMethod("CreatureCurios", "Monster", "OnDead", -1);
 Interceptor.attach(monsterOnDead, {
   onEnter(args) {
     try {
+      const state = stateFor(args[0]);
       const valueBuffer = Memory.alloc(4);
       monoFieldGetValue(args[0], monsterIdField, valueBuffer);
       const monsterId = valueBuffer.readS32();
       send({ type: "monster_dead_observed", monster_id: monsterId });
       if (monsterId === bossMonsterId) {
+        if (state.bossDeathEmitted) return;
+        state.bossDeathEmitted = true;
         send({
           type: "boss_dead",
           source: "Monster.OnDead",
