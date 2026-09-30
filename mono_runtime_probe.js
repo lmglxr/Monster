@@ -154,6 +154,42 @@ function hookSetter(className, methodName, callback) {
   hookCount += 1;
 }
 
+function hookObjectSetter(className, methodName, callback) {
+  const address = findMethod("Protoc", className, methodName, 1);
+  Interceptor.attach(address, {
+    onEnter(args) {
+      try {
+        callback(args[0], args[1]);
+      } catch (error) {
+        send({ type: "probe_warning", error: `${className}.${methodName}: ${error}` });
+      }
+    }
+  });
+  hookCount += 1;
+}
+
+// 当前版本的场景 ID 不在场景响应对象本身，而是位于
+// set_ResSceneInfo(PSceneInfo) 的嵌套参数中。旧探针只读取整数 setter，
+// 因而副本已经退出时也收不到普通场景确认。
+const pSceneInfoClass = findClass("Protoc", "PSceneInfo");
+const pSceneTidField = monoClassGetFieldFromName(pSceneInfoClass, utf8("sceneTid_"));
+const pSceneUidField = monoClassGetFieldFromName(pSceneInfoClass, utf8("sceneUid_"));
+if (pSceneTidField.isNull()) {
+  throw new Error("Protoc.PSceneInfo.sceneTid_ not found");
+}
+
+function readSceneInfo(sceneInfoPointer) {
+  if (sceneInfoPointer.isNull()) return null;
+  const sceneTid = readIntField(sceneInfoPointer, pSceneTidField);
+  if (sceneTid === undefined) return null;
+  return {
+    scene_tid: sceneTid,
+    scene_uid: pSceneUidField.isNull()
+      ? undefined
+      : readIntField(sceneInfoPointer, pSceneUidField)
+  };
+}
+
 function tryHookSceneSetter(className, methodName) {
   try {
     hookSetter(className, methodName, (objectPointer, value) => {
@@ -167,6 +203,27 @@ function tryHookSceneSetter(className, methodName) {
   } catch (error) {
     // Game builds differ in which scene response class they expose. Missing
     // optional scene fields must not prevent the Boss HP probe from starting.
+  }
+}
+
+function tryHookSceneInfoSetter(className, methodName) {
+  try {
+    hookObjectSetter(className, methodName, (objectPointer, sceneInfoPointer) => {
+      const scene = readSceneInfo(sceneInfoPointer);
+      if (scene === null) return;
+      send({
+        type: "scene_update",
+        source: `Protoc.${className}.${methodName}`,
+        scene_id: scene.scene_tid,
+        scene_uid: scene.scene_uid
+      });
+    });
+    send({
+      type: "probe_diagnostic",
+      scene_info_hook: `Protoc.${className}.${methodName}`
+    });
+  } catch (error) {
+    // 不同游戏构建的响应类型可能不同；缺失可选入口时仍应保留其余探针能力。
   }
 }
 
@@ -185,6 +242,39 @@ function tryHookSceneSetter(className, methodName) {
     tryHookSceneSetter(className, methodName);
   });
 });
+
+// 当前构建在这三个转场响应中携带嵌套的 PSceneInfo。它们只在转场发生时
+// 触发，不读取高频实体同步流，避免造成额外日志噪声。
+[
+  "SceneChangeRsp",
+  "SceneCreateDungeonInnerRsp",
+  "EnterSceneInnerRsp"
+].forEach((className) => {
+  tryHookSceneInfoSetter(className, "set_ResSceneInfo");
+});
+
+// 收到退出响应只表示服务器已经处理请求；自动化仍必须等待真实场景返回
+// 普通场景后才进入下一轮。这个独立信号用于诊断“点击未生效”和“确认漏读”。
+// 某些 Mono 运行时会把这类简单 setter 编译为不可拦截的共享跳板，因此
+// 其失败必须保持为可选诊断，不能影响场景和 Boss 探针启动。
+function tryHookDungeonResponse(className, eventType) {
+  try {
+    hookSetter(className, "set_Ret", (objectPointer, value) => {
+      send({ type: eventType, ret: value });
+    });
+    send({
+      type: "probe_diagnostic",
+      dungeon_response_hook: `Protoc.${className}.set_Ret`
+    });
+  } catch (error) {
+    send({
+      type: "probe_diagnostic",
+      dungeon_response_hook_error: `Protoc.${className}.set_Ret: ${error}`
+    });
+  }
+}
+tryHookDungeonResponse("ScenarioExitRsp", "dungeon_exit_response");
+tryHookDungeonResponse("ScenarioEnterRsp", "dungeon_enter_response");
 
 // SceneEntityBaseInfoSyncEvent payload: correlate the instance entity id,
 // monster configuration id and current HP on the same protobuf object.

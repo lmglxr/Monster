@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
+from mono_runtime_probe import MonoRuntimeProbe
 from mvp_bot import Bot
 
 
@@ -109,6 +111,50 @@ class BotLogicTests(unittest.TestCase):
             [("weapon", "farm"), ("sell", "medicine"), ("travel", "farm")],
         )
         self.assertEqual(events.count(("fight", "boss")), 1)
+
+
+class MonoRuntimeProbeMessageTests(unittest.TestCase):
+    @staticmethod
+    def bare_probe() -> MonoRuntimeProbe:
+        return MonoRuntimeProbe(
+            process_id=0,
+            boss_monster_id=10005,
+            script_path=Path("unused.js"),
+        )
+
+    def test_scene_update_records_nested_scene_identity(self) -> None:
+        probe = self.bare_probe()
+        probe._on_message(
+            {
+                "payload": {
+                    "type": "scene_update",
+                    "scene_id": 1002,
+                    "scene_uid": 987654,
+                    "source": "Protoc.SceneChangeRsp.set_ResSceneInfo",
+                }
+            },
+            None,
+        )
+
+        snapshot = probe.snapshot()
+        self.assertEqual(snapshot["latest_scene_id"], 1002)
+        self.assertEqual(snapshot["latest_scene_uid"], 987654)
+        self.assertEqual(
+            snapshot["latest_scene_source"],
+            "Protoc.SceneChangeRsp.set_ResSceneInfo",
+        )
+        self.assertEqual(snapshot["scene_revision"], 1)
+
+    def test_dungeon_exit_response_is_exposed_in_snapshot(self) -> None:
+        probe = self.bare_probe()
+        probe._on_message(
+            {"payload": {"type": "dungeon_exit_response", "ret": 0}},
+            None,
+        )
+
+        snapshot = probe.snapshot()
+        self.assertEqual(snapshot["latest_dungeon_exit_ret"], 0)
+        self.assertEqual(snapshot["dungeon_exit_revision"], 1)
 
 
 if __name__ == "__main__":

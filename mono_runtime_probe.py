@@ -23,8 +23,14 @@ class MonoRuntimeProbe:
         self.latest_max_hp: Optional[int] = None
         self.latest_fatigue: Optional[int] = None
         self.latest_scene_id: Optional[int] = None
+        self.latest_scene_uid: Optional[int] = None
+        self.latest_scene_source: Optional[str] = None
         self.scene_revision = 0
         self.fatigue_revision = 0
+        self.dungeon_exit_revision = 0
+        self.dungeon_enter_revision = 0
+        self.latest_dungeon_exit_ret: Optional[int] = None
+        self.latest_dungeon_enter_ret: Optional[int] = None
         self._ready_at: Optional[float] = None
         self._fatigue_updated_at: Optional[float] = None
         self._last_logged_fatigue: Optional[int] = None
@@ -145,6 +151,21 @@ class MonoRuntimeProbe:
                     logging.info("Mono Monster HP 候选入口：%s。", ", ".join(candidates) or "未找到")
                 elif payload.get("scene_hook"):
                     logging.info("Mono 场景入口已挂钩：%s。", payload["scene_hook"])
+                elif payload.get("scene_info_hook"):
+                    logging.info(
+                        "Mono 嵌套场景入口已挂钩：%s。",
+                        payload["scene_info_hook"],
+                    )
+                elif payload.get("dungeon_response_hook"):
+                    logging.info(
+                        "Mono 副本响应入口已挂钩：%s。",
+                        payload["dungeon_response_hook"],
+                    )
+                elif payload.get("dungeon_response_hook_error"):
+                    logging.warning(
+                        "Mono 副本响应入口不可用，将仅依赖真实场景确认：%s。",
+                        payload["dungeon_response_hook_error"],
+                    )
                 else:
                     logging.warning("Mono HP 方法诊断：%s", payload)
             elif kind == "fatigue":
@@ -153,16 +174,6 @@ class MonoRuntimeProbe:
                     self.latest_fatigue = value
                     self.fatigue_revision += 1
                     self._fatigue_updated_at = time.monotonic()
-            elif kind == "scene_update":
-                scene_id = payload.get("scene_id")
-                if scene_id is not None:
-                    self.latest_scene_id = int(scene_id)
-                    self.scene_revision += 1
-                    logging.info(
-                        "Mono 运行时场景更新：SceneId=%s（%s）。",
-                        self.latest_scene_id,
-                        payload.get("source", "runtime"),
-                    )
                     # 每次同步都保留在内存中，但不再把每一点变化都
                     # 打到常规日志。首值和大幅变化才记 INFO，其余只记 DEBUG。
                     should_log = (
@@ -177,6 +188,40 @@ class MonoRuntimeProbe:
                     )
                     if should_log:
                         self._last_logged_fatigue = value
+            elif kind == "scene_update":
+                scene_id = payload.get("scene_id")
+                if scene_id is not None:
+                    self.latest_scene_id = int(scene_id)
+                    scene_uid = payload.get("scene_uid")
+                    self.latest_scene_uid = (
+                        None if scene_uid is None else int(scene_uid)
+                    )
+                    self.latest_scene_source = str(
+                        payload.get("source", "runtime")
+                    )
+                    self.scene_revision += 1
+                    logging.info(
+                        "Mono 运行时场景更新：SceneTid=%s，SceneUid=%s（%s）。",
+                        self.latest_scene_id,
+                        self.latest_scene_uid,
+                        self.latest_scene_source,
+                    )
+            elif kind == "dungeon_exit_response":
+                self.latest_dungeon_exit_ret = int(payload["ret"])
+                self.dungeon_exit_revision += 1
+                logging.info(
+                    "Mono 已收到副本退出响应：Ret=%s（第 %s 次）。",
+                    self.latest_dungeon_exit_ret,
+                    self.dungeon_exit_revision,
+                )
+            elif kind == "dungeon_enter_response":
+                self.latest_dungeon_enter_ret = int(payload["ret"])
+                self.dungeon_enter_revision += 1
+                logging.info(
+                    "Mono 已收到副本进入响应：Ret=%s（第 %s 次）。",
+                    self.latest_dungeon_enter_ret,
+                    self.dungeon_enter_revision,
+                )
             elif kind == "monster_dead_observed":
                 monster_id = int(payload.get("monster_id", 0))
                 now = time.monotonic()
@@ -218,8 +263,14 @@ class MonoRuntimeProbe:
                 "latest_max_hp": self.latest_max_hp,
                 "latest_fatigue": self.latest_fatigue,
                 "latest_scene_id": self.latest_scene_id,
+                "latest_scene_uid": self.latest_scene_uid,
+                "latest_scene_source": self.latest_scene_source,
                 "scene_revision": self.scene_revision,
                 "fatigue_revision": self.fatigue_revision,
+                "dungeon_exit_revision": self.dungeon_exit_revision,
+                "dungeon_enter_revision": self.dungeon_enter_revision,
+                "latest_dungeon_exit_ret": self.latest_dungeon_exit_ret,
+                "latest_dungeon_enter_ret": self.latest_dungeon_enter_ret,
                 "ready_age_seconds": (
                     None if self._ready_at is None else now - self._ready_at
                 ),
