@@ -2629,7 +2629,7 @@ class Bot:
             float(
                 timing_cfg.get(
                     "exit_confirm_timeout_seconds",
-                    timing_cfg.get("exit_confirm_settle_seconds", 1.2),
+                    5.0,
                 )
             ),
         )
