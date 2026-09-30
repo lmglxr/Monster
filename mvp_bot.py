@@ -1484,6 +1484,49 @@ class Bot:
             self.wait(0.1)
         return False
 
+    def close_exit_retry_panels(self) -> list[str]:
+        """完整退出重试前，仅关闭已识别的遮挡界面，避免在 HUD 上盲按 ESC。"""
+        inventory_cfg = self.cfg.get("inventory_automation", {})
+        inventory_threshold = float(
+            inventory_cfg.get("panel_match_threshold", 0.72)
+        )
+        map_threshold = float(
+            self.cfg.get("map_detection", {}).get(
+                "open_match_threshold", 0.72
+            )
+        )
+        panel_specs = (
+            ("售卖数量框", self.sell_quantity_template, inventory_threshold),
+            ("杂货铺", self.shop_template, inventory_threshold),
+            ("背包", self.inventory_template, inventory_threshold),
+            ("地图", self.map_template, map_threshold),
+        )
+        max_presses = max(
+            1, int(inventory_cfg.get("close_escape_presses", 3))
+        )
+        step_seconds = max(
+            0.05, float(inventory_cfg.get("panel_step_seconds", 0.6))
+        )
+        closed: list[str] = []
+        for _ in range(max_presses):
+            frame = self.capture_frame()
+            visible_names = [
+                name
+                for name, template, threshold in panel_specs
+                if template is not None
+                and self.template_match(frame, template)[1] >= threshold
+            ]
+            if not visible_names:
+                break
+            logging.warning(
+                "退出重试前检测到遮挡界面：%s；按 ESC 收起后再执行完整退出流程。",
+                "、".join(visible_names),
+            )
+            self.window.tap_key("ESC", live=self.live)
+            closed.extend(visible_names)
+            self.wait(step_seconds)
+        return list(dict.fromkeys(closed))
+
     def wait_for_exit_loading_start(self, timeout: float) -> bool:
         """确认退出点击已触发真实场景加载，而不是只相信固定坐标点击。"""
         deadline = time.monotonic() + max(0.5, float(timeout))
@@ -1650,6 +1693,12 @@ class Bot:
         attempts = max(1, int(action_cfg.get("inventory_open_attempts", 2)))
         score = 0.0
         for attempt in range(1, attempts + 1):
+            logging.info(
+                "背包未确认打开，按 %s 尝试打开背包（第 %s/%s 次）。",
+                str(action_cfg.get("open_key", "B")).upper(),
+                attempt,
+                attempts,
+            )
             self.window.tap_key(
                 str(action_cfg.get("open_key", "B")),
                 hold_seconds=float(action_cfg.get("open_key_hold_seconds", 0.12)),
@@ -2691,6 +2740,8 @@ class Bot:
                         attempts,
                     )
                 else:
+                    if attempt > 1:
+                        self.close_exit_retry_panels()
                     logging.info(
                         "执行完整退出副本流程（第 %s/%s 次，确认弹窗最多等待 %.1f 秒，"
                         "退出加载等待 %.1f 秒，场景确认最多 %.1f 秒）。",

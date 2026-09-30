@@ -214,6 +214,33 @@ class BotLogicTests(unittest.TestCase):
         )
         self.assertTrue(bot._dungeon_exit_started)
 
+    def test_exit_cleans_known_panels_before_second_full_retry(self) -> None:
+        bot = self.bare_bot()
+        bot._dungeon_exit_started = False
+        bot.cfg = {
+            "timing": {
+                "exit_click_attempts": 2,
+                "exit_confirm_timeout_seconds": 5.0,
+                "exit_load_seconds": 3.0,
+                "scene_transition_timeout_seconds": 8.0,
+            }
+        }
+        bot.runtime_probe = None
+        bot.log_tail = type("LogTailStub", (), {"scene_revision": 0})()
+        clicks: list[str] = []
+        cleanup_calls: list[str] = []
+        dialog_results = iter((False, False, False, False))
+        bot.set_phase = lambda *_args, **_kwargs: None
+        bot.click = lambda name: clicks.append(name)
+        bot.wait_for_exit_confirm_dialog = lambda timeout: next(dialog_results)
+        bot.close_exit_retry_panels = lambda: cleanup_calls.append("cleanup") or []
+
+        with self.assertRaisesRegex(RuntimeError, "未收到普通场景确认"):
+            bot.exit_dungeon()
+
+        self.assertEqual(clicks, ["exit_dungeon_button", "exit_dungeon_button"])
+        self.assertEqual(cleanup_calls, ["cleanup"])
+
     def test_boss_loot_uses_repeated_short_pickup_presses(self) -> None:
         bot = self.bare_bot()
         bot.cfg = {
