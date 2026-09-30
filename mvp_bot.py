@@ -795,6 +795,9 @@ class Bot:
         self.shop_template = self._load_gray_template("general_store_title.png")
         self.sell_quantity_template = self._load_gray_template("sell_quantity_title.png")
         self.medicine_item_template = self._load_gray_template("medicine_item_icon.png")
+        self.exit_confirm_template = self._load_gray_template(
+            "exit_confirm_dialog.png"
+        )
         self.scene_loading_template = self._load_gray_template(
             "scene_loading_indicator.png"
         )
@@ -1422,6 +1425,28 @@ class Bot:
             )
         )
         return self.ui_template_visible(self.scene_loading_template, threshold)
+
+    def exit_confirm_dialog_visible(self) -> tuple[bool, float]:
+        """检测“确定要退出副本吗？”确认弹窗，避免盲点确认坐标。"""
+        threshold = float(
+            self.cfg.get("timing", {}).get(
+                "exit_confirm_match_threshold", 0.78
+            )
+        )
+        return self.ui_template_visible(self.exit_confirm_template, threshold)
+
+    def wait_for_exit_confirm_dialog(self, timeout: float) -> bool:
+        """等待退出确认弹窗真实出现；卡顿时不再按固定时间盲点确认。"""
+        deadline = time.monotonic() + max(0.5, float(timeout))
+        while time.monotonic() < deadline and not self.stopped:
+            visible, score = self.exit_confirm_dialog_visible()
+            if visible:
+                logging.info(
+                    "已检测到退出确认弹窗（匹配分数 %.3f），执行确认退出。", score
+                )
+                return True
+            self.wait(0.1)
+        return False
 
     def wait_for_exit_loading_start(self, timeout: float) -> bool:
         """确认退出点击已触发真实场景加载，而不是只相信固定坐标点击。"""
@@ -2571,8 +2596,14 @@ class Bot:
         self.set_phase("exiting_dungeon")
         timing_cfg = self.cfg.get("timing", {})
         attempts = max(1, int(timing_cfg.get("exit_click_attempts", 3)))
-        confirm_settle = max(
-            0.8, float(timing_cfg.get("exit_confirm_settle_seconds", 1.2))
+        confirm_timeout = max(
+            1.0,
+            float(
+                timing_cfg.get(
+                    "exit_confirm_timeout_seconds",
+                    timing_cfg.get("exit_confirm_settle_seconds", 1.2),
+                )
+            ),
         )
         exit_load = max(1.5, float(timing_cfg.get("exit_load_seconds", 3.0)))
         scene_timeout = max(
@@ -2588,23 +2619,30 @@ class Bot:
                 )
                 log_scene_revision = self.log_tail.scene_revision
                 logging.info(
-                    "执行退出副本点击流程（第 %s/%s 次，确认框等待 %.1f 秒，"
+                    "执行退出副本点击流程（第 %s/%s 次，确认弹窗最多等待 %.1f 秒，"
                     "退出加载等待 %.1f 秒，场景确认最多 %.1f 秒）。",
                     attempt,
                     attempts,
-                    confirm_settle,
+                    confirm_timeout,
                     exit_load,
                     scene_timeout,
                 )
                 self.click("exit_dungeon_button")
-                if not self.wait(confirm_settle):
+                if not self.wait_for_exit_confirm_dialog(confirm_timeout):
+                    logging.warning(
+                        "第 %s 次点击退出后未检测到确认弹窗，不点击确认坐标，"
+                        "将重新尝试退出图标。",
+                        attempt,
+                    )
+                    continue
+                if self.stopped:
                     return
                 self.click("confirm_exit_button")
                 # 实测退出成功后会先出现“场景切换中”加载页，但当前游戏版本
                 # 的 Mono 场景包没有稳定给出 SceneTid。先用加载页确认点击已
                 # 生效，确认后绝不能再次点击退出按钮。
                 if self.wait_for_exit_loading_start(
-                    min(scene_timeout, max(2.0, confirm_settle + 1.5))
+                    min(scene_timeout, max(2.0, confirm_timeout + 1.5))
                 ):
                     if self.wait_for_exit_loading_end(scene_timeout + exit_load):
                         self._dungeon_exit_started = True
