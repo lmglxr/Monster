@@ -26,7 +26,7 @@
   },
   "fatigue": {
     "_comment": "疲劳值检测与模式切换参数。游戏疲劳显示范围按 -1000～1000 处理。",
-    "low_threshold": -800,
+    "low_threshold": -50,
     "_low_threshold_comment": "普通挂机时，Mono 读数小于或等于此值便停止普通挂机并进入 BOSS 副本恢复循环；OCR 仅为降级兜底。",
     "boss_target": 800,
     "_boss_target_comment": "Mono 读数大于或等于此值时立即退出 BOSS 循环并恢复普通挂机；降级检测仍保留最低副本次数。",
@@ -145,6 +145,11 @@
     "_boss_entity_id_comment": "旧版 Player.log 战斗诊断中的目标实体 ID，仅供日志解析使用。它不是 Mono MonsterId。",
     "boss_monster_id": 10005,
     "_boss_monster_id_comment": "当前副本 BOSS 在 Mono CreatureCurios.Monster.m_monsterId 中的配置 ID；本机运行时实测死亡事件为 10005。更换 BOSS 时需要重新确认。",
+    "boss_monster_ids": [
+      10005,
+      10009
+    ],
+    "_boss_monster_ids_comment": "运行时需要同时追踪的副本 Boss MonsterId。2026-09-30 实测暗黑鲨鱼死亡事件为 10009，普通 Boss 为 10005；保留 boss_monster_id 兼容旧配置。",
     "boss_max_hp": 18000,
     "_boss_max_hp_comment": "目标 BOSS 的初始/最大生命值，保留用于诊断和后续强化日志校验。",
     "boss_death_detection_mode": "runtime_first",
@@ -248,6 +253,8 @@
     "_comment": "只刷副本模式的目标过滤。进入副本并寻路到 BOSS 后，只有识别到暗黑鲨鱼才开始战斗。",
     "enabled": true,
     "identification_mode": "runtime_hp",
+    "monster_id": 10009,
+    "_monster_id_comment": "2026-09-30 实测暗黑鲨鱼在 Mono 死亡事件中的 MonsterId。运行时会同时追踪它与普通 Boss 10005，并读取各自 HP。",
     "dark_max_hp": 26000,
     "normal_max_hp": 18000,
   "entry_runtime_hp_timeout_seconds": 3.0,
@@ -281,6 +288,8 @@
     "_boss_timeout_seconds_comment": "单场 BOSS 战允许的最长时间。复活后会重新计时；超时且日志仍未确认 BOSS 死亡时，脚本会退出本次副本，重新检查疲劳后继续流程，不会暂停整个挂机任务。",
     "exit_load_seconds": 3.0,
     "_exit_load_seconds_comment": "确认退出副本后等待返回普通区域并完成加载的时间。",
+    "exit_loading_match_threshold": 0.78,
+    "_exit_loading_match_threshold_comment": "退出确认后“场景切换中”模板的最低匹配分数。实测普通副本画面约 0.24，加载页约 1.00；检测到加载页后不再重复点击退出。",
     "exit_click_attempts": 3,
     "_exit_click_attempts_comment": "退出按钮和确认按钮整套点击流程的最大重试次数，防止云电脑加载慢或首次点击失效。",
     "exit_confirm_settle_seconds": 1.2,

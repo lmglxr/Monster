@@ -1,6 +1,6 @@
 // Read-only Mono runtime probe. It observes generated protobuf setters and never
 // writes game memory or changes method return values.
-const bossMonsterId = __BOSS_MONSTER_ID__;
+const bossMonsterIds = new Set(__BOSS_MONSTER_IDS__);
 const mono = Process.getModuleByName("mono-2.0-bdwgc.dll");
 
 function monoFn(name, ret, args) {
@@ -98,8 +98,12 @@ function stateFor(objectPointer) {
   return state;
 }
 
+function isTrackedBoss(monsterId) {
+  return bossMonsterIds.has(monsterId);
+}
+
 function emitBossBaseInfo(state) {
-  if (state.monsterId !== bossMonsterId) return;
+  if (!isTrackedBoss(state.monsterId)) return;
   if (state.entityId !== undefined) bossEntityIds.add(state.entityId);
   send({
     type: "boss_seen",
@@ -243,6 +247,11 @@ function tryHookSceneInfoSetter(className, methodName) {
   });
 });
 
+// 部分 protobuf 解析路径会先把一个空的 PSceneInfo 赋给响应对象，再在
+// 同一对象上填充 SceneTid。此时仅监听 set_ResSceneInfo 会读到 0，因此
+// 还要直接监听嵌套对象的实际 SceneTid setter。
+tryHookSceneSetter("PSceneInfo", "set_SceneTid");
+
 // 当前构建在这三个转场响应中携带嵌套的 PSceneInfo。它们只在转场发生时
 // 触发，不读取高频实体同步流，避免造成额外日志噪声。
 [
@@ -299,14 +308,14 @@ hookSetter("EntityBaseInfo", "set_CurHp", (objectPointer, value) => {
 hookSetter("KillEvent", "set_KilledId", (objectPointer, value) => {
   const state = stateFor(objectPointer);
   state.killedId = value;
-  if (state.monsterId === bossMonsterId) {
+  if (isTrackedBoss(state.monsterId)) {
     send({ type: "boss_dead", source: "KillInfoSyncEvent", monster_id: state.monsterId, entity_id: value });
   }
 });
 hookSetter("KillEvent", "set_MonsterId", (objectPointer, value) => {
   const state = stateFor(objectPointer);
   state.monsterId = value;
-  if (value === bossMonsterId) {
+  if (isTrackedBoss(value)) {
     send({ type: "boss_dead", source: "KillInfoSyncEvent", monster_id: value, entity_id: state.killedId });
   }
 });
@@ -445,7 +454,7 @@ function emitBossRuntimeHp(objectPointer, source) {
   try {
     const state = stateFor(objectPointer);
     const monsterId = readIntField(objectPointer, monsterIdField);
-    if (monsterId !== bossMonsterId) return;
+    if (!isTrackedBoss(monsterId)) return;
     const hp = monsterGetHp !== null
       ? monsterGetHp(objectPointer)
       : readIntField(objectPointer, monsterHpField);
@@ -487,7 +496,7 @@ Interceptor.attach(monsterOnDead, {
       monoFieldGetValue(args[0], monsterIdField, valueBuffer);
       const monsterId = valueBuffer.readS32();
       send({ type: "monster_dead_observed", monster_id: monsterId });
-      if (monsterId === bossMonsterId) {
+      if (isTrackedBoss(monsterId)) {
         if (state.bossDeathEmitted) return;
         state.bossDeathEmitted = true;
         send({
@@ -512,7 +521,7 @@ Interceptor.attach(monsterOnShow, {
       if (this.monsterObject === undefined) return;
       monoFieldGetValue(this.monsterObject, monsterIdField, valueBuffer);
       const monsterId = valueBuffer.readS32();
-      if (monsterId === bossMonsterId) {
+      if (isTrackedBoss(monsterId)) {
         bossMonsterObject = this.monsterObject;
         send({
           type: "boss_seen",
@@ -597,4 +606,8 @@ if (!fatigueCoroutineClass.isNull()) {
   }
 }
 
-send({ type: "probe_ready", hooks: hookCount, boss_monster_id: bossMonsterId });
+send({
+  type: "probe_ready",
+  hooks: hookCount,
+  boss_monster_ids: Array.from(bossMonsterIds)
+});

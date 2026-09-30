@@ -751,9 +751,19 @@ class Bot:
         self.log_tail.start_at_end()
         self.runtime_probe: Optional[MonoRuntimeProbe] = None
         self._monster_death_log_state: dict[int, tuple[float, int]] = {}
-        self._monster_death_log_state: dict[int, tuple[float, int]] = {}
         combat_cfg = cfg.get("combat", {})
         dark_cfg = cfg.get("dark_boss", {})
+        configured_boss_ids = combat_cfg.get(
+            "boss_monster_ids",
+            [combat_cfg.get("boss_monster_id", 10005)],
+        )
+        if not isinstance(configured_boss_ids, (list, tuple, set)):
+            configured_boss_ids = [configured_boss_ids]
+        tracked_boss_ids = [int(monster_id) for monster_id in configured_boss_ids]
+        dark_boss_id = dark_cfg.get("monster_id")
+        if dark_boss_id is not None:
+            tracked_boss_ids.append(int(dark_boss_id))
+        tracked_boss_ids = list(dict.fromkeys(tracked_boss_ids))
         dark_hp_probe_required = (
             mode == "dungeon"
             and bool(dark_cfg.get("enabled", False))
@@ -772,6 +782,7 @@ class Bot:
                 self.window.process_id(),
                 int(combat_cfg.get("boss_monster_id", 10005)),
                 MONO_PROBE_SCRIPT,
+                boss_monster_ids=tracked_boss_ids,
             )
             self.runtime_probe.start()
         # OCR 模型占用明显高于其余模块；延迟到完整闭环真正读取疲劳时再加载。
@@ -784,6 +795,9 @@ class Bot:
         self.shop_template = self._load_gray_template("general_store_title.png")
         self.sell_quantity_template = self._load_gray_template("sell_quantity_title.png")
         self.medicine_item_template = self._load_gray_template("medicine_item_icon.png")
+        self.scene_loading_template = self._load_gray_template(
+            "scene_loading_indicator.png"
+        )
         self.dark_boss_template = self._load_color_template("dark_shark_boss.png")
         self.weapon_variant_templates = {
             "farm": self._load_gray_template("weapon_variant_a_icon.png"),
@@ -1370,8 +1384,10 @@ class Bot:
             if hp is not None:
                 last_hp = int(hp)
                 logging.info(
-                    "Mono %s读取 Boss HP=%s（暗黑鲨鱼目标=%s，普通 Boss=%s）。",
+                    "Mono %s读取 Boss：MonsterId=%s，HP=%s"
+                    "（暗黑鲨鱼目标=%s，普通 Boss=%s）。",
                     context,
+                    snapshot.get("latest_monster_id"),
                     last_hp,
                     self.cfg.get("dark_boss", {}).get("dark_max_hp", 26000),
                     self.cfg.get("dark_boss", {}).get("normal_max_hp", 18000),
@@ -1397,6 +1413,42 @@ class Bot:
             return False, 0.0
         _, score = self.template_match(self.capture_frame(), template)
         return score >= threshold, score
+
+    def scene_loading_visible(self) -> tuple[bool, float]:
+        """检测退出确认后实际出现的“场景切换中”加载页。"""
+        threshold = float(
+            self.cfg.get("timing", {}).get(
+                "exit_loading_match_threshold", 0.78
+            )
+        )
+        return self.ui_template_visible(self.scene_loading_template, threshold)
+
+    def wait_for_exit_loading_start(self, timeout: float) -> bool:
+        """确认退出点击已触发真实场景加载，而不是只相信固定坐标点击。"""
+        deadline = time.monotonic() + max(0.5, float(timeout))
+        while time.monotonic() < deadline and not self.stopped:
+            visible, score = self.scene_loading_visible()
+            if visible:
+                logging.info(
+                    "已检测到副本退出后的场景加载画面（匹配分数 %.3f）。", score
+                )
+                return True
+            self.wait(0.1)
+        return False
+
+    def wait_for_exit_loading_end(self, timeout: float) -> bool:
+        """已看到加载页后，等待其消失，避免尚在读图时继续下一轮寻路。"""
+        deadline = time.monotonic() + max(1.0, float(timeout))
+        while time.monotonic() < deadline and not self.stopped:
+            visible, score = self.scene_loading_visible()
+            if not visible:
+                logging.info(
+                    "副本退出加载画面已消失（匹配分数 %.3f），继续普通场景流程。",
+                    score,
+                )
+                return True
+            self.wait(0.15)
+        return False
 
     def find_inventory_icon(
         self,
@@ -2548,6 +2600,22 @@ class Bot:
                 if not self.wait(confirm_settle):
                     return
                 self.click("confirm_exit_button")
+                # 实测退出成功后会先出现“场景切换中”加载页，但当前游戏版本
+                # 的 Mono 场景包没有稳定给出 SceneTid。先用加载页确认点击已
+                # 生效，确认后绝不能再次点击退出按钮。
+                if self.wait_for_exit_loading_start(
+                    min(scene_timeout, max(2.0, confirm_settle + 1.5))
+                ):
+                    if self.wait_for_exit_loading_end(scene_timeout + exit_load):
+                        self._dungeon_exit_started = True
+                        logging.info(
+                            "已通过场景加载画面确认退出副本，开始下一轮前置流程。"
+                        )
+                        return
+                    raise RuntimeError(
+                        "已触发副本退出场景加载，但加载画面长时间未消失；"
+                        "已暂停，避免重复点击退出按钮。"
+                    )
                 if not self.wait(exit_load):
                     return
                 if not self.wait_for_scene(

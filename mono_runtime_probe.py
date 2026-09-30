@@ -5,15 +5,27 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 
 class MonoRuntimeProbe:
     """Optional read-only Frida bridge for the game's embedded Mono runtime."""
 
-    def __init__(self, process_id: int, boss_monster_id: int, script_path: Path):
+    def __init__(
+        self,
+        process_id: int,
+        boss_monster_id: int,
+        script_path: Path,
+        boss_monster_ids: Optional[Iterable[int]] = None,
+    ):
         self.process_id = int(process_id)
         self.boss_monster_id = int(boss_monster_id)
+        configured_ids = boss_monster_ids or (self.boss_monster_id,)
+        self.boss_monster_ids = tuple(
+            dict.fromkeys(int(monster_id) for monster_id in configured_ids)
+        )
+        if not self.boss_monster_ids:
+            self.boss_monster_ids = (self.boss_monster_id,)
         self.script_path = script_path
         self.available = False
         self.boss_seen = False
@@ -21,6 +33,7 @@ class MonoRuntimeProbe:
         self.death_source: Optional[str] = None
         self.latest_hp: Optional[int] = None
         self.latest_max_hp: Optional[int] = None
+        self.latest_monster_id: Optional[int] = None
         self.latest_fatigue: Optional[int] = None
         self.latest_scene_id: Optional[int] = None
         self.latest_scene_uid: Optional[int] = None
@@ -48,7 +61,7 @@ class MonoRuntimeProbe:
             import frida
 
             source = self.script_path.read_text(encoding="utf-8").replace(
-                "__BOSS_MONSTER_ID__", json.dumps(self.boss_monster_id)
+                "__BOSS_MONSTER_IDS__", json.dumps(list(self.boss_monster_ids))
             )
             self._session = frida.attach(self.process_id)
             self._session.on("detached", self._on_detached)
@@ -94,19 +107,22 @@ class MonoRuntimeProbe:
                 self.available = True
                 self._ready_at = time.monotonic()
                 logging.info(
-                    "Mono 运行时只读探针已连接：%s 个事件钩子，BOSS MonsterId=%s。",
+                    "Mono 运行时只读探针已连接：%s 个事件钩子，"
+                    "追踪 BOSS MonsterId=%s。",
                     payload.get("hooks"),
-                    payload.get("boss_monster_id"),
+                    payload.get("boss_monster_ids", self.boss_monster_ids),
                 )
             elif kind == "boss_seen":
                 first_seen = not self.boss_seen
                 self.boss_seen = True
+                if payload.get("monster_id") is not None:
+                    self.latest_monster_id = int(payload["monster_id"])
                 if payload.get("hp") is not None:
                     self.latest_hp = int(payload["hp"])
                 if first_seen:
                     logging.info(
                         "Mono 运行时已识别本轮 BOSS：MonsterId=%s（%s）。",
-                        payload.get("monster_id", self.boss_monster_id),
+                        self.latest_monster_id,
                         payload.get("source", "runtime"),
                     )
             elif kind == "boss_dead":
@@ -114,11 +130,15 @@ class MonoRuntimeProbe:
                 self.boss_seen = True
                 self.boss_dead = True
                 self.death_source = str(payload.get("source", "Mono runtime"))
+                if payload.get("monster_id") is not None:
+                    self.latest_monster_id = int(payload["monster_id"])
                 if payload.get("hp") is not None:
                     self.latest_hp = int(payload["hp"])
                 if not was_dead:
                     logging.info("Mono 运行时收到 BOSS 死亡事件：%s", self.death_source)
             elif kind == "boss_hp":
+                if payload.get("monster_id") is not None:
+                    self.latest_monster_id = int(payload["monster_id"])
                 if payload.get("hp") is not None:
                     self.latest_hp = int(payload["hp"])
                 if payload.get("max_hp") is not None:
@@ -130,7 +150,8 @@ class MonoRuntimeProbe:
                     or now - self._last_boss_hp_log_at >= 5.0
                 ):
                     logging.info(
-                        "Mono Boss HP 更新：当前=%s，最大=%s（%s）。",
+                        "Mono Boss HP 更新：MonsterId=%s，当前=%s，最大=%s（%s）。",
+                        self.latest_monster_id,
                         self.latest_hp,
                         self.latest_max_hp,
                         payload.get("source", "runtime"),
@@ -191,7 +212,15 @@ class MonoRuntimeProbe:
             elif kind == "scene_update":
                 scene_id = payload.get("scene_id")
                 if scene_id is not None:
-                    self.latest_scene_id = int(scene_id)
+                    scene_id = int(scene_id)
+                    if scene_id <= 0:
+                        logging.debug(
+                            "忽略无效场景更新 SceneTid=%s（%s）。",
+                            scene_id,
+                            payload.get("source", "runtime"),
+                        )
+                        return
+                    self.latest_scene_id = scene_id
                     scene_uid = payload.get("scene_uid")
                     self.latest_scene_uid = (
                         None if scene_uid is None else int(scene_uid)
@@ -248,6 +277,7 @@ class MonoRuntimeProbe:
             self.boss_seen = False
             self.boss_dead = False
             self.death_source = None
+            self.latest_monster_id = None
             self.latest_hp = None
             self.latest_max_hp = None
 
@@ -259,6 +289,7 @@ class MonoRuntimeProbe:
                 "boss_seen": self.boss_seen,
                 "boss_dead": self.boss_dead,
                 "death_source": self.death_source,
+                "latest_monster_id": self.latest_monster_id,
                 "latest_hp": self.latest_hp,
                 "latest_max_hp": self.latest_max_hp,
                 "latest_fatigue": self.latest_fatigue,

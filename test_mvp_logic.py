@@ -112,6 +112,37 @@ class BotLogicTests(unittest.TestCase):
         )
         self.assertEqual(events.count(("fight", "boss")), 1)
 
+    def test_exit_uses_loading_screen_confirmation_before_scene_id(self) -> None:
+        bot = self.bare_bot()
+        bot._dungeon_exit_started = False
+        bot.cfg = {
+            "timing": {
+                "exit_click_attempts": 3,
+                "exit_confirm_settle_seconds": 1.2,
+                "exit_load_seconds": 3.0,
+                "scene_transition_timeout_seconds": 8.0,
+            }
+        }
+        bot.runtime_probe = None
+        bot.log_tail = type("LogTailStub", (), {"scene_revision": 0})()
+        events: list[tuple[str, object]] = []
+        bot.set_phase = lambda name, combat=False: events.append(("phase", name))
+        bot.click = lambda name: events.append(("click", name))
+        bot.wait = lambda seconds: events.append(("wait", seconds)) or True
+        bot.wait_for_exit_loading_start = lambda timeout: True
+        bot.wait_for_exit_loading_end = lambda timeout: True
+        bot.wait_for_scene = lambda *_args, **_kwargs: self.fail(
+            "已确认加载画面时不得等待失效的场景 ID"
+        )
+
+        bot.exit_dungeon()
+
+        self.assertEqual(
+            [event for event in events if event[0] == "click"],
+            [("click", "exit_dungeon_button"), ("click", "confirm_exit_button")],
+        )
+        self.assertTrue(bot._dungeon_exit_started)
+
 
 class MonoRuntimeProbeMessageTests(unittest.TestCase):
     @staticmethod
@@ -155,6 +186,48 @@ class MonoRuntimeProbeMessageTests(unittest.TestCase):
         snapshot = probe.snapshot()
         self.assertEqual(snapshot["latest_dungeon_exit_ret"], 0)
         self.assertEqual(snapshot["dungeon_exit_revision"], 1)
+
+    def test_invalid_scene_zero_does_not_create_transition(self) -> None:
+        probe = self.bare_probe()
+        probe._on_message(
+            {
+                "payload": {
+                    "type": "scene_update",
+                    "scene_id": 0,
+                    "source": "Protoc.SceneChangeRsp.set_ResSceneInfo",
+                }
+            },
+            None,
+        )
+
+        snapshot = probe.snapshot()
+        self.assertIsNone(snapshot["latest_scene_id"])
+        self.assertEqual(snapshot["scene_revision"], 0)
+
+    def test_dark_boss_hp_event_retains_monster_id(self) -> None:
+        probe = MonoRuntimeProbe(
+            process_id=0,
+            boss_monster_id=10005,
+            boss_monster_ids=(10005, 10009),
+            script_path=Path("unused.js"),
+        )
+        probe._on_message(
+            {
+                "payload": {
+                    "type": "boss_hp",
+                    "monster_id": 10009,
+                    "hp": 26000,
+                    "max_hp": 26000,
+                    "source": "Monster.OnShow.fields",
+                }
+            },
+            None,
+        )
+
+        snapshot = probe.snapshot()
+        self.assertEqual(probe.boss_monster_ids, (10005, 10009))
+        self.assertEqual(snapshot["latest_monster_id"], 10009)
+        self.assertEqual(snapshot["latest_max_hp"], 26000)
 
 
 if __name__ == "__main__":
