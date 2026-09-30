@@ -2574,12 +2574,40 @@ class Bot:
         logging.info("状态：拾取 BOSS 掉落。")
         self.set_phase("boss_loot")
         try:
-            self.window.tap_key(
-                self.cfg["combat"]["pickup_key"],
-                hold_seconds=self.cfg["combat"]["boss_pickup_hold_seconds"],
-                live=self.live,
+            combat_cfg = self.cfg["combat"]
+            pickup_key = str(combat_cfg.get("pickup_key", "SPACE"))
+            pickup_count = max(
+                1, int(combat_cfg.get("boss_loot_pickup_presses", 5))
             )
-            self.wait(1.5)
+            pickup_interval = max(
+                0.1,
+                float(
+                    combat_cfg.get(
+                        "boss_loot_pickup_interval_seconds",
+                        combat_cfg.get("boss_pickup_interval_seconds", 0.5),
+                    )
+                ),
+            )
+            tap_hold = min(
+                0.1,
+                max(0.01, float(combat_cfg.get("combat_key_hold_seconds", 0.05))),
+            )
+            logging.info(
+                "BOSS 掉落拾取：短按 %s %s 次，间隔 %.2f 秒。",
+                pickup_key,
+                pickup_count,
+                pickup_interval,
+            )
+            for press_index in range(pickup_count):
+                if self.stopped:
+                    return
+                self.window.tap_key(
+                    pickup_key,
+                    hold_seconds=tap_hold,
+                    live=self.live,
+                )
+                if press_index + 1 < pickup_count and not self.wait(pickup_interval):
+                    return
         except Exception as exc:
             # 拾取不是流程闭环的必要条件；即使拾取输入失败，也必须继续
             # 执行退出，避免角色停在已结束的副本里。

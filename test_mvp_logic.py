@@ -167,6 +167,36 @@ class BotLogicTests(unittest.TestCase):
 
         self.assertEqual(clicks, ["exit_dungeon_button"])
 
+    def test_boss_loot_uses_repeated_short_pickup_presses(self) -> None:
+        bot = self.bare_bot()
+        bot.cfg = {
+            "combat": {
+                "pickup_key": "SPACE",
+                "combat_key_hold_seconds": 0.05,
+                "boss_loot_pickup_presses": 3,
+                "boss_loot_pickup_interval_seconds": 0.5,
+            }
+        }
+        bot.window = _WindowStub()
+        waits: list[float] = []
+        bot.set_phase = lambda *_args, **_kwargs: None
+        bot.wait = lambda seconds: waits.append(seconds) or True
+        exits: list[str] = []
+        bot.exit_dungeon = lambda: exits.append("exit")
+
+        bot.pickup_and_exit()
+
+        self.assertEqual(
+            bot.window.keys,
+            [
+                ("SPACE", 0.05, False),
+                ("SPACE", 0.05, False),
+                ("SPACE", 0.05, False),
+            ],
+        )
+        self.assertEqual(waits, [0.5, 0.5])
+        self.assertEqual(exits, ["exit"])
+
 
 class MonoRuntimeProbeMessageTests(unittest.TestCase):
     @staticmethod
