@@ -129,7 +129,8 @@ class BotLogicTests(unittest.TestCase):
         bot.set_phase = lambda name, combat=False: events.append(("phase", name))
         bot.click = lambda name: events.append(("click", name))
         bot.wait = lambda seconds: events.append(("wait", seconds)) or True
-        bot.wait_for_exit_confirm_dialog = lambda timeout: True
+        dialog_results = iter((False, True))
+        bot.wait_for_exit_confirm_dialog = lambda timeout: next(dialog_results)
         bot.wait_for_exit_loading_start = lambda timeout: True
         bot.wait_for_exit_loading_end = lambda timeout: True
         bot.wait_for_scene = lambda *_args, **_kwargs: self.fail(
@@ -178,12 +179,12 @@ class BotLogicTests(unittest.TestCase):
 
         self.assertTrue(bot.wait_for_exit_confirm_dialog(5.0))
 
-    def test_exit_retries_confirm_when_dialog_remains_after_no_scene(self) -> None:
+    def test_exit_retries_residual_confirm_before_full_exit_flow(self) -> None:
         bot = self.bare_bot()
         bot._dungeon_exit_started = False
         bot.cfg = {
             "timing": {
-                "exit_click_attempts": 1,
+                "exit_click_attempts": 2,
                 "exit_confirm_timeout_seconds": 5.0,
                 "exit_load_seconds": 3.0,
                 "scene_transition_timeout_seconds": 8.0,
@@ -196,7 +197,8 @@ class BotLogicTests(unittest.TestCase):
         bot.set_phase = lambda *_args, **_kwargs: None
         bot.click = lambda name: clicks.append(name)
         bot.wait = lambda seconds: True
-        bot.wait_for_exit_confirm_dialog = lambda timeout: True
+        dialog_results = iter((False, True, True))
+        bot.wait_for_exit_confirm_dialog = lambda timeout: next(dialog_results)
         bot.wait_for_exit_loading_start = lambda timeout: False
         bot.wait_for_scene = lambda *_args, **_kwargs: next(scene_results)
 
