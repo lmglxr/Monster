@@ -1435,14 +1435,50 @@ class Bot:
         )
         return self.ui_template_visible(self.exit_confirm_template, threshold)
 
+    def exit_confirm_button_fallback_visible(self) -> tuple[bool, float]:
+        """模板漏检时，用确认按钮区域的红橙色占比作退出弹窗兜底。"""
+        timing_cfg = self.cfg.get("timing", {})
+        region = timing_cfg.get(
+            "exit_confirm_button_region", [0.43, 0.49, 0.52, 0.59]
+        )
+        threshold = float(
+            timing_cfg.get("exit_confirm_orange_ratio", 0.20)
+        )
+        frame = self.capture_frame()
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = region
+        crop = frame[int(y1 * h):int(y2 * h), int(x1 * w):int(x2 * w)]
+        if crop.size == 0:
+            return False, 0.0
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        # 退出确认按钮在不同显示器/色彩设置下可能偏红或偏橙，故覆盖
+        # OpenCV 色相 0～35 的红橙区间；区域固定在弹窗确认键位置。
+        mask = cv2.inRange(
+            hsv,
+            np.array([0, 90, 120], dtype=np.uint8),
+            np.array([35, 255, 255], dtype=np.uint8),
+        )
+        ratio = float(np.count_nonzero(mask)) / float(mask.size)
+        return ratio >= threshold, ratio
+
     def wait_for_exit_confirm_dialog(self, timeout: float) -> bool:
-        """等待退出确认弹窗真实出现；卡顿时不再按固定时间盲点确认。"""
+        """等待退出确认弹窗；模板漏检时识别确认键的红橙色兜底。"""
         deadline = time.monotonic() + max(0.5, float(timeout))
         while time.monotonic() < deadline and not self.stopped:
             visible, score = self.exit_confirm_dialog_visible()
             if visible:
                 logging.info(
                     "已检测到退出确认弹窗（匹配分数 %.3f），执行确认退出。", score
+                )
+                return True
+            fallback_visible, orange_ratio = (
+                self.exit_confirm_button_fallback_visible()
+            )
+            if fallback_visible:
+                logging.warning(
+                    "退出确认弹窗模板未命中，但确认键红橙色占比 %.3f，"
+                    "按兜底规则执行确认退出。",
+                    orange_ratio,
                 )
                 return True
             self.wait(0.1)
@@ -2690,6 +2726,45 @@ class Bot:
                     runtime_scene_revision=runtime_scene_revision,
                     log_scene_revision=log_scene_revision,
                 ):
+                    # 第一次确认点击可能因焦点切换、网络抖动或 Unity 卡顿而
+                    # 没有被消费。此时若确认弹窗仍在，直接重试确认键；不要
+                    # 再点击被弹窗覆盖的退出图标。
+                    if self.wait_for_exit_confirm_dialog(
+                        min(2.0, confirm_timeout)
+                    ):
+                        logging.warning(
+                            "退出后未确认普通场景且确认弹窗仍存在，"
+                            "重试点击确认退出按钮。"
+                        )
+                        self.click("confirm_exit_button")
+                        if self.wait_for_exit_loading_start(
+                            min(scene_timeout, max(2.0, confirm_timeout + 1.5))
+                        ):
+                            if self.wait_for_exit_loading_end(
+                                scene_timeout + exit_load
+                            ):
+                                self._dungeon_exit_started = True
+                                logging.info(
+                                    "已通过确认键重试后的场景加载画面确认退出副本。"
+                                )
+                                return
+                            raise RuntimeError(
+                                "确认键重试后已触发场景加载，但加载画面长时间未消失；"
+                                "已暂停，避免重复点击退出按钮。"
+                            )
+                        if not self.wait(exit_load):
+                            return
+                        if self.wait_for_scene(
+                            "normal",
+                            scene_timeout,
+                            runtime_scene_revision=runtime_scene_revision,
+                            log_scene_revision=log_scene_revision,
+                        ):
+                            self._dungeon_exit_started = True
+                            logging.info(
+                                "已通过确认键重试后的场景确认退出副本。"
+                            )
+                            return
                     logging.warning(
                         "第 %s 次退出点击后未确认已回到普通场景，将重试；"
                         "不会进入下一轮。",

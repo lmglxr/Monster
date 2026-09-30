@@ -167,6 +167,51 @@ class BotLogicTests(unittest.TestCase):
 
         self.assertEqual(clicks, ["exit_dungeon_button"])
 
+    def test_exit_confirm_uses_orange_button_fallback(self) -> None:
+        bot = self.bare_bot()
+        bot.cfg = {"timing": {}}
+        bot.exit_confirm_dialog_visible = lambda: (False, 0.42)
+        bot.exit_confirm_button_fallback_visible = lambda: (True, 0.31)
+        bot.wait = lambda seconds: self.fail(
+            "确认键色彩兜底命中后不应继续等待"
+        )
+
+        self.assertTrue(bot.wait_for_exit_confirm_dialog(5.0))
+
+    def test_exit_retries_confirm_when_dialog_remains_after_no_scene(self) -> None:
+        bot = self.bare_bot()
+        bot._dungeon_exit_started = False
+        bot.cfg = {
+            "timing": {
+                "exit_click_attempts": 1,
+                "exit_confirm_timeout_seconds": 5.0,
+                "exit_load_seconds": 3.0,
+                "scene_transition_timeout_seconds": 8.0,
+            }
+        }
+        bot.runtime_probe = None
+        bot.log_tail = type("LogTailStub", (), {"scene_revision": 0})()
+        clicks: list[str] = []
+        scene_results = iter((False, True))
+        bot.set_phase = lambda *_args, **_kwargs: None
+        bot.click = lambda name: clicks.append(name)
+        bot.wait = lambda seconds: True
+        bot.wait_for_exit_confirm_dialog = lambda timeout: True
+        bot.wait_for_exit_loading_start = lambda timeout: False
+        bot.wait_for_scene = lambda *_args, **_kwargs: next(scene_results)
+
+        bot.exit_dungeon()
+
+        self.assertEqual(
+            clicks,
+            [
+                "exit_dungeon_button",
+                "confirm_exit_button",
+                "confirm_exit_button",
+            ],
+        )
+        self.assertTrue(bot._dungeon_exit_started)
+
     def test_boss_loot_uses_repeated_short_pickup_presses(self) -> None:
         bot = self.bare_bot()
         bot.cfg = {
