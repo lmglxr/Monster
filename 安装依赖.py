@@ -61,22 +61,13 @@ def run_pip(index_url: str, requirements: Path, *extra: str) -> bool:
 
 
 def main() -> int:
-    install_ocr = "--ocr" in sys.argv[1:]
-    if not install_ocr:
-        try:
-            import json
-
-            config = json.loads((APP_DIR / "config.json").read_text(encoding="utf-8"))
-            install_ocr = bool(config.get("combat", {}).get("easyocr_enabled", False))
-        except (OSError, json.JSONDecodeError):
-            pass
-    print("正在准备 Python 依赖；网络较慢时会自动切换下载源。")
+    print("正在准备纯视觉版 Python 依赖（含 EasyOCR）；网络较慢时会自动切换下载源。")
     for index_url in sources():
         print(f"尝试 Python 源：{index_url}")
         if not run_pip(index_url, REQUIREMENTS):
             print(f"当前源安装失败，将切换下一个源：{index_url}")
             continue
-        if install_ocr and not run_pip(index_url, OCR_REQUIREMENTS, "install"):
+        if not run_pip(index_url, OCR_REQUIREMENTS, "install"):
             print(f"当前源安装 OCR 依赖失败，将切换下一个源：{index_url}")
             continue
         if not repair_pywin32():

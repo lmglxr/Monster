@@ -12,7 +12,7 @@
     "input_mode": "focus_pulse",
     "_input_mode_comment": "输入模式。focus_pulse=需要输入时短暂切到游戏并恢复，允许平时使用其他窗口；foreground_only=旧版行为，游戏不在前台时暂停输入。连续战斗会频繁产生很短的焦点切换，可能影响同时打字。",
     "capture_mode": "print_window",
-    "_capture_mode_comment": "截图模式。print_window=直接捕获游戏客户区，实测被其他窗口遮挡时仍可 OCR 和模板识别；screen=旧版桌面区域截图，被遮挡时会截到其他窗口。",
+    "_capture_mode_comment": "模板识别默认使用 print_window，可在游戏被遮挡时工作。疲劳 OCR 会在短暂前台悬停期间固定使用屏幕截图，以取得 Unity 未交给 PrintWindow 的底部 HUD/提示框。",
     "focus_settle_seconds": 0.08,
     "_focus_settle_seconds_comment": "每次临时切到游戏后、真正发送按键或鼠标前的稳定等待时间，单位为秒。过短可能丢输入，过长会让焦点切换更明显。",
     "focus_activation_attempts": 3,
@@ -27,13 +27,11 @@
   "fatigue": {
     "_comment": "疲劳值检测与模式切换参数。游戏疲劳显示范围按 -1000～1000 处理。",
     "low_threshold": -800,
-    "_low_threshold_comment": "普通挂机时，Mono 读数小于或等于此值便停止普通挂机并进入 BOSS 副本恢复循环；OCR 仅为降级兜底。",
+    "_low_threshold_comment": "普通挂机时，画面 OCR 识别到疲劳值小于或等于此值，便停止普通挂机并进入 BOSS 副本恢复循环。",
     "boss_target": 800,
-    "_boss_target_comment": "Mono 读数大于或等于此值时立即退出 BOSS 循环并恢复普通挂机；降级检测仍保留最低副本次数。",
-    "check_interval_seconds": 400,
-    "_check_interval_seconds_comment": "普通挂机期间疲劳状态检查的最长间隔，单位为秒；Mono 事件仍会实时更新。",
-    "runtime_stale_fallback_seconds": 180.0,
-    "_runtime_stale_fallback_seconds_comment": "Mono 探针在线时不使用 EasyOCR。只有连接后长时间从未收到疲劳值，或最后数值超过此秒数未更新，才允许一次 OCR 降级。",
+    "_boss_target_comment": "BOSS 副本恢复后，画面 OCR 识别到疲劳值大于或等于此值，便返回普通挂机。",
+    "check_interval_seconds": 300.0,
+    "_check_interval_seconds_comment": "普通挂机期间每 300 秒请求一次画面 OCR。OCR 推理在后台线程运行；冒烟测试会用独立配置覆盖为更短间隔。",
     "hover_point": [
       0.946094,
       0.969444
@@ -46,19 +44,35 @@
     "_refresh_point_comment": "每次检查疲劳前，鼠标会先移到此处使旧提示框失效，再移回 hover_point，从而强制游戏显示最新状态。建议选择画面中央且不会触发其他悬停面板的位置。",
     "refresh_leave_seconds": 0.25,
     "_refresh_leave_seconds_comment": "鼠标移出状态栏后等待旧提示框消失的时间，单位为秒；若提示框未及时关闭，可适当增大。",
-    "hover_settle_seconds": 0.8,
-    "_hover_settle_seconds_comment": "鼠标重新移回状态栏后，等待最新疲劳提示框完全显示的时间，单位为秒。",
+    "hover_settle_seconds": 1.5,
+    "_hover_settle_seconds_comment": "鼠标移回疲劳状态栏后，等待 1.5 秒让最新提示框完整显示，再截取一帧交给后台 OCR；若云电脑/低帧率仍偶发失败，可提高到 2.0 秒。",
     "post_dungeon_extra_ocr_rounds": 2,
     "_post_dungeon_extra_ocr_rounds_comment": "退出副本后，首次 OCR 完全失败时追加的刷新识别轮数。每轮都会重新把鼠标移出并移回状态栏；全部失败后记录警告并继续下一次副本，不中断挂机。",
     "ocr_retry_interval_seconds": 0.5,
     "_ocr_retry_interval_seconds_comment": "追加 OCR 轮次之间的等待时间，单位为秒。",
     "ocr_region": [
-      0.74,
-      0.68,
+      0.84,
+      0.75,
       0.998,
       0.94
     ],
-    "_ocr_region_comment": "疲劳提示框的 OCR 截图范围，格式为 [左, 上, 右, 下] 的客户区归一化坐标。范围过大会引入无关文字，过小可能裁掉数值。"
+    "_ocr_region_comment": "已按 1280×720、DPI 感知后的实际疲劳提示框校准：覆盖右下角完整提示框，并排除左侧无关战斗文字。",
+    "result_timeout_seconds": 20.0,
+    "_result_timeout_seconds_comment": "在进入/退出副本等非战斗关口等待单次后台 OCR 返回的最长时间，单位为秒。",
+    "value_region": [
+      0.895,
+      0.785,
+      0.998,
+      0.835
+    ],
+    "_value_region_comment": "疲劳提示框首行红色数值的精确区域；先对该区域做红字增强 OCR，再以整块提示框作为兼容兜底。",
+    "number_region": [
+      0.945,
+      0.785,
+      0.998,
+      0.835
+    ],
+    "_number_region_comment": "仅覆盖首行红色疲劳数字，从数字开始处右侧裁切，不含“当前疲劳值”标签；EasyOCR 优先在此区域按置信度读取，避免标签笔画与数字粘连成 3045 一类错误结果。"
   },
   "coordinates": {
     "_comment": "自动点击使用的客户区归一化坐标，均为 [x, y]。除 map_button 可单独重录外，其余点位可通过‘校准坐标.bat’重新记录。",
@@ -104,7 +118,7 @@
     "_confirm_exit_button_comment": "退出副本确认弹窗中的确认按钮中心。"
   },
   "combat": {
-    "_comment": "普通挂机和 BOSS 战的按键、频率以及日志识别参数。A、Space、Q、W 使用彼此独立的计时器，任何一个技能处于冷却都不会阻塞其他按键。按键名称必须是程序 VK 表中支持的名称。",
+    "_comment": "战斗按键与纯视觉 BOSS 判定参数。BOSS 死亡只由疲劳值恢复确认，不附加或读取游戏进程。",
     "attack_key": "A",
     "_attack_key_comment": "基础攻击键；当前战斗配置通常保持 A。",
     "attack_interval_seconds": 0.45,
@@ -143,31 +157,14 @@
     "_boss_loot_pickup_presses_comment": "BOSS 死亡后退出前短按拾取键的次数。每次短按都触发一次拾取，避免旧版长按无反应。",
     "boss_loot_pickup_interval_seconds": 0.5,
     "_boss_loot_pickup_interval_seconds_comment": "BOSS 死亡后相邻两次短按 Space 的间隔，单位为秒。",
-    "boss_entity_id": 100043,
-    "_boss_entity_id_comment": "旧版 Player.log 战斗诊断中的目标实体 ID，仅供日志解析使用。它不是 Mono MonsterId。",
-    "boss_monster_id": 10005,
-    "_boss_monster_id_comment": "当前副本 BOSS 在 Mono CreatureCurios.Monster.m_monsterId 中的配置 ID；本机运行时实测死亡事件为 10005。更换 BOSS 时需要重新确认。",
-    "boss_monster_ids": [
-      10005,
-      10009
-    ],
-    "_boss_monster_ids_comment": "运行时需要同时追踪的副本 Boss MonsterId。2026-09-30 实测暗黑鲨鱼死亡事件为 10009，普通 Boss 为 10005；保留 boss_monster_id 兼容旧配置。",
-    "boss_max_hp": 18000,
-    "_boss_max_hp_comment": "目标 BOSS 的初始/最大生命值，保留用于诊断和后续强化日志校验。",
-    "boss_death_detection_mode": "runtime_first",
-    "_boss_death_detection_mode_comment": "BOSS 死亡检测来源。runtime_first=Mono 运行时事件优先、Player.log 次之，Mono 可用时不加载 OCR；log_first=日志优先、OCR 兜底；log_only=只读日志；ocr_only=只用疲劳 OCR。",
-    "runtime_probe_enabled": true,
-    "_runtime_probe_enabled_comment": "是否允许只读附加到游戏的 Mono 运行时，监听 KillInfo、HP/LifeDead 和 HuntFatigue 同步。false 会完全取消进程附加，并自动回退到日志/OCR。",
-    "easyocr_enabled": false,
-    "_easyocr_enabled_comment": "是否安装并启用 EasyOCR 备用识别。false 时完整链路只使用 Frida/日志，不下载 torch、torchvision 和 EasyOCR。",
-    "boss_fatigue_fallback_enabled": true,
-    "_boss_fatigue_fallback_enabled_comment": "兼容旧配置的 OCR 总开关。false 会关闭 OCR 提供器但不影响日志；通常保持 true，并优先通过 boss_death_detection_mode 选择策略。",
     "boss_fatigue_probe_initial_delay_seconds": 12.0,
     "_boss_fatigue_probe_initial_delay_seconds_comment": "开始攻击后第一次检查疲劳增量前等待的秒数。过小会频繁打断攻击；普通配置建议 10～20 秒。",
     "boss_fatigue_probe_interval_seconds": 4.0,
     "_boss_fatigue_probe_interval_seconds_comment": "第一次检查没有确认击杀时，后续疲劳检查间隔，单位为秒。",
     "boss_fatigue_gain_threshold": 80,
-    "_boss_fatigue_gain_threshold_comment": "所有模式相对本场 Boss 战前的疲劳值至少增加多少才视为 Boss 已死亡。当前统一使用 80，避免 HP/死亡事件缺失时流程中断。"
+    "_boss_fatigue_gain_threshold_comment": "本场 BOSS 战中，疲劳值相对战前基准至少增加此数值，才视为击杀候选。",
+    "boss_fatigue_confirm_samples": 2,
+    "_boss_fatigue_confirm_samples_comment": "击杀候选需要连续多少个后台 OCR 结果满足疲劳增量阈值，避免单帧误识别。"
   },
   "travel_mount": {
     "_comment": "普通世界地图点击目标并开始自动寻路后按 F 骑乘宠物。仅用于去副本入口和返回刷怪点，副本内去 BOSS 点绝不按 F。",
@@ -244,23 +241,10 @@
     "panel_step_seconds": 0.6,
     "_panel_step_seconds_comment": "连续关闭多个面板时，每次 ESC 之间的等待时间，单位为秒。"
   },
-  "scenes": {
-    "_comment": "用于解析 Player.log 和区分地图状态的场景参数。",
-    "normal_scene_id": 1002,
-    "_normal_scene_id_comment": "普通挂机区域的场景 ID。",
-    "boss_scene_id_is_dynamic": true,
-    "_boss_scene_id_is_dynamic_comment": "true 表示副本实例的场景 ID 每次进入都可能变化，因此不使用固定 ID 判断；当前脚本按此模式设计。"
-  },
   "dark_boss": {
     "_comment": "只刷副本模式的目标过滤。进入副本并寻路到 BOSS 后，只有识别到暗黑鲨鱼才开始战斗。",
     "enabled": true,
-    "identification_mode": "runtime_hp",
-    "monster_id": 10009,
-    "_monster_id_comment": "2026-09-30 实测暗黑鲨鱼在 Mono 死亡事件中的 MonsterId。运行时会同时追踪它与普通 Boss 10005，并读取各自 HP。",
-    "dark_max_hp": 26000,
-    "normal_max_hp": 18000,
-  "entry_runtime_hp_timeout_seconds": 3.0,
-  "boss_runtime_hp_timeout_seconds": 6.0,
+    "identification_mode": "image",
     "_enabled_comment": "仅影响只刷副本.bat；完整闭环仍按原逻辑刷普通 BOSS。",
     "match_threshold": 0.8,
     "_match_threshold_comment": "暗黑鲨鱼模板匹配阈值。当前默认 0.80，优先避免把普通 BOSS 误判为暗黑鲨鱼。",
@@ -272,7 +256,8 @@
       0.1,
       0.88,
       0.9
-    ]
+    ],
+    "_identification_mode_comment": "固定为 image：只用暗黑鲨鱼外观模板确认目标，不读取 Boss HP。"
   },
   "timing": {
     "_comment": "界面、寻路、加载和战斗各阶段的等待时间，单位均为秒。网络或电脑较慢时可适当增大，过短容易在界面尚未就绪时误操作。",
@@ -295,13 +280,9 @@
     "exit_click_attempts": 3,
     "_exit_click_attempts_comment": "退出按钮和确认按钮整套点击流程的最大重试次数，防止云电脑加载慢或首次点击失效。",
     "exit_confirm_settle_seconds": 1.2,
-    "_exit_confirm_settle_seconds_comment": "旧版兼容字段。新版优先使用 exit_confirm_timeout_seconds，并通过确认弹窗模板判断是否真正出现。",
-    "exit_confirm_timeout_seconds": 5.0,
-    "_exit_confirm_timeout_seconds_comment": "点击退出图标后等待“确定要退出副本吗？”确认弹窗出现的最长时间。检测到弹窗才点击确认，避免卡顿或遮挡时盲点确认坐标。",
-    "exit_confirm_match_threshold": 0.78,
-    "_exit_confirm_match_threshold_comment": "退出确认弹窗模板的最低匹配分数。实测未出现时约 0.41、半出现约 0.85、完整出现为 1.00。",
+    "_exit_confirm_settle_seconds_comment": "点击退出副本后，等待退出确认框完全出现的时间，单位为秒。",
     "scene_transition_timeout_seconds": 8.0,
-    "_scene_transition_timeout_seconds_comment": "点击确认退出后等待 Mono/日志确认回到普通场景的最长时间，单位为秒。未确认时不会进入下一轮。",
+    "_scene_transition_timeout_seconds_comment": "点击确认退出后，等待加载画面出现/消失的最长时间，单位为秒。未确认时不会进入下一轮。",
     "panel_wait_seconds": 0.5,
     "_panel_wait_seconds_comment": "通用面板操作的预留等待时间；当前版本保留此参数，部分流程可能未直接使用。",
     "circle_click_interval_seconds": 0.35,
@@ -309,13 +290,8 @@
     "combat_input_quiet_seconds": 0.2,
     "_combat_input_quiet_seconds_comment": "从战斗切换到地图或寻路操作前，释放攻击/拾取键后的静默等待时间。"
   },
-  "boss_loop": {
-    "_comment": "BOSS 疲劳恢复循环的控制参数。",
-    "minimum_runs": 10,
-    "_minimum_runs_comment": "降级检测时，每轮进入 BOSS 恢复模式后至少完成的副本次数。Mono 精确读数达到目标时不受此限制。"
-  },
   "debug": {
-    "_comment": "诊断截图与日志辅助参数。",
+    "_comment": "诊断截图参数。OCR 失败时可保存少量画面截图，便于校准。",
     "ocr_failure_min_interval_seconds": 60,
     "_ocr_failure_min_interval_seconds_comment": "OCR 识别失败截图的最短保存间隔，单位为秒，用于防止短时间生成大量图片。",
     "max_ocr_failure_images": 20,
@@ -350,7 +326,7 @@
     "_recovery_settle_seconds_comment": "地图恢复轮次中，释放按键以及关闭遮挡面板后的稳定等待时间，单位为秒。"
   },
   "recovery": {
-    "_comment": "窗口和截图层面的通用恢复参数。达到次数上限后才会让自动流程安全暂停。",
+    "_comment": "窗口与截图层面的通用恢复参数。窗口恢复后仅通过画面模板继续验证，不读取游戏日志或场景 ID。",
     "capture_retries": 5,
     "_capture_retries_comment": "单次截图失败时最多连续尝试的总次数，包括第一次截图。每次失败后都会重新枚举游戏窗口。",
     "capture_retry_seconds": 0.5,
@@ -358,9 +334,7 @@
     "window_reconnect_attempts": 5,
     "_window_reconnect_attempts_comment": "游戏窗口句柄失效后，重新查找同名窗口的最大次数。",
     "window_reconnect_interval_seconds": 2.0,
-    "_window_reconnect_interval_seconds_comment": "相邻两次重新查找游戏窗口之间的等待时间，单位为秒。",
-    "scene_confirm_seconds": 3.0,
-    "_scene_confirm_seconds_comment": "窗口重新连接后等待 Player.log 提供新场景记录的最长时间，单位为秒；若暂时没有新记录，会保留最近已知场景并在后续流程继续验证。"
+    "_window_reconnect_interval_seconds_comment": "相邻两次重新查找游戏窗口之间的等待时间，单位为秒。"
   },
   "revive": {
     "_comment": "死亡面板检测、原地复活按钮识别以及第二轮恢复参数。第二轮仍失败时会暂停，避免在死亡界面盲目操作。",
@@ -398,6 +372,9 @@
     "post_revive_seconds": 1.0,
     "_post_revive_seconds_comment": "确认复活面板消失后，恢复原流程前的稳定等待时间，单位为秒。"
   },
-  "log_path": "auto",
-  "_log_path_comment": "游戏 Player.log 的路径。推荐保持 auto：程序会根据正在运行的 CreatureCurios.exe 自动定位游戏目录下的 Logs/Player.log，因此项目克隆到任意目录都能使用。也可填写绝对路径；相对路径以项目目录为起点。"
+  "boss_loop": {
+    "_comment": "Boss 疲劳恢复循环的轮次控制。前 minimum_runs 次确认击杀并退出后不读取疲劳，达到次数后才在每次退出时复核是否已恢复到目标值。",
+    "minimum_runs": 10,
+    "_minimum_runs_comment": "每次从普通挂机切入 Boss 恢复时，至少完成 10 次确认击杀的副本；这十次退出后跳过疲劳 OCR，以提高循环速度。"
+  }
 }

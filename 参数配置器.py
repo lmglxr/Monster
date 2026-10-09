@@ -24,6 +24,7 @@ FIELDS = [
         ("普通挂机低疲劳阈值", ("fatigue", "low_threshold"), "int", "低于或等于此值时进入副本"),
         ("Boss 恢复目标值", ("fatigue", "boss_target"), "int", "达到或超过此值时返回普通地图"),
         ("普通挂机检查间隔（秒）", ("fatigue", "check_interval_seconds"), "float", None),
+        ("OCR 结果等待上限（秒）", ("fatigue", "result_timeout_seconds"), "float", "仅在进出副本等非战斗关口等待后台 OCR"),
     ]),
     ("战斗参数", [
         ("基础攻击间隔（秒）", ("combat", "attack_interval_seconds"), "float", None),
@@ -32,8 +33,8 @@ FIELDS = [
         ("Q 技能间隔（秒）", ("combat", "skill_q_interval_seconds"), "float", None),
         ("启用 W 技能", ("combat", "skill_w_enabled"), "bool", None),
         ("W 技能间隔（秒）", ("combat", "skill_w_interval_seconds"), "float", None),
-        ("启用 Frida Mono 探针", ("combat", "runtime_probe_enabled"), "bool", "需要 Frida 能够附加游戏进程"),
-        ("启用 EasyOCR 备用识别", ("combat", "easyocr_enabled"), "bool", "关闭可跳过 torch、torchvision 和 OCR 模型下载"),
+        ("Boss 疲劳增量阈值", ("combat", "boss_fatigue_gain_threshold"), "int", "达到该增量后作为死亡候选"),
+        ("Boss 连续确认次数", ("combat", "boss_fatigue_confirm_samples"), "int", "连续 OCR 结果均满足阈值才判定死亡"),
     ]),
     ("背包与武器", [
         ("启用背包自动化", ("inventory_automation", "enabled"), "bool", None),
@@ -65,7 +66,7 @@ def set_value(data: dict, path: tuple[str, ...], value) -> None:
 class ConfigEditor(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Curious Beast 参数配置器 v0.0.2")
+        self.title("Curious Beast 参数配置器 v0.0.3")
         self.geometry("720x760")
         self.minsize(650, 620)
         self.config_data: dict = {}

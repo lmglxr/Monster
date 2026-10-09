@@ -13,6 +13,7 @@ import re
 import sys
 import time
 import warnings
+from concurrent.futures import Future, ThreadPoolExecutor
 import winsound
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,8 +30,26 @@ import win32process
 import win32ui
 import winerror
 
-from mono_runtime_probe import MonoRuntimeProbe
 
+def enable_per_monitor_dpi_awareness() -> None:
+    """Keep Win32 coordinates, cursor input and ImageGrab pixels in one scale."""
+    try:
+        # Per-monitor v2 prevents logical 1024×576 coordinates being mixed with a
+        # physical 1280×720 capture on a Windows display scaled to 125%.
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
+    except (AttributeError, OSError):
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            logging.warning("无法启用 DPI 感知；高 DPI 显示器上的 OCR 坐标可能不准确。")
+
+
+enable_per_monitor_dpi_awareness()
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
@@ -39,7 +58,6 @@ INVENTORY_PROFILE_PATH = APP_DIR / "inventory_profile.json"
 INVENTORY_PROFILE_EXAMPLE_PATH = APP_DIR / "inventory_profile.example.json"
 ASSET_DIR = APP_DIR / "assets"
 RUNTIME_LOG = APP_DIR / "runtime.log"
-MONO_PROBE_SCRIPT = APP_DIR / "mono_runtime_probe.js"
 DEBUG_DIR = APP_DIR / "debug"
 APP_VERSION = "0.0.3"
 
@@ -61,31 +79,14 @@ VK = {
 # 数字左侧的文字残影偶尔会被 EasyOCR 误认成负号，因此忽略分子符号，
 # 只根据分母前是否存在负号决定最终结果的正负。
 FATIGUE_RE = re.compile(r"(?<!\d)-?(\d{1,4})\s*/\s*(-?)\s*1000\b")
-COMBAT_RE = re.compile(
-    r"场景:(\d+)\s+当前场景:(\d+)\s+目标:(\d+).*?HP:(\d+).*?生命:(\w+)"
-)
-SCENE_RE = re.compile(r"当前场景:(\d+)")
-
-
 def load_config() -> dict:
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    raw_log_value = str(cfg.get("log_path", "auto")).strip()
-    raw_log_path = Path(raw_log_value)
-    if raw_log_value.lower() != "auto" and not raw_log_path.is_absolute():
-        cfg["log_path"] = str((APP_DIR / raw_log_path).resolve())
-    return cfg
+        return json.load(f)
 
 
 def save_config(cfg: dict) -> None:
-    saved = dict(cfg)
-    if str(cfg.get("log_path", "auto")).lower() != "auto":
-        try:
-            saved["log_path"] = os.path.relpath(cfg["log_path"], APP_DIR).replace("\\", "/")
-        except ValueError:
-            pass
     with CONFIG_PATH.open("w", encoding="utf-8") as f:
-        json.dump(saved, f, ensure_ascii=False, indent=2)
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
         f.write("\n")
 
 
@@ -411,6 +412,15 @@ class GameWindow:
                     self.reconnect_epoch += 1
         raise RuntimeError(f"连续 {retries} 次游戏截图失败：{last_error}")
 
+    def capture_screen(self) -> np.ndarray:
+        """Capture the foreground client with ImageGrab, regardless of template mode."""
+        original_mode = self.capture_mode
+        try:
+            self.capture_mode = "screen"
+            return self.capture()
+        finally:
+            self.capture_mode = original_mode
+
     def normalized_to_client(self, point: list[float]) -> tuple[int, int]:
         w, h = self.client_size()
         return int(round(point[0] * w)), int(round(point[1] * h))
@@ -521,75 +531,6 @@ class GameWindow:
                 win32api.keybd_event(VK[name.upper()], 0, win32con.KEYEVENTF_KEYUP, 0)
 
 
-class LogTail:
-    def __init__(self, path: str, boss_entity_id: int = 100043):
-        self.path = Path(path)
-        self.boss_entity_id = int(boss_entity_id)
-        self.position = 0
-        self.latest_scene: Optional[int] = None
-        self.scene_revision = 0
-        self.boss_seen = False
-        self.boss_dead = False
-
-    def start_at_end(self) -> None:
-        if not self.path.exists():
-            raise FileNotFoundError(f"找不到游戏日志：{self.path}")
-        self.position = self.path.stat().st_size
-
-    def poll(self) -> list[str]:
-        if not self.path.exists():
-            return []
-        size = self.path.stat().st_size
-        if size < self.position:
-            self.position = 0
-        if size == self.position:
-            return []
-        with self.path.open("r", encoding="utf-8", errors="replace") as f:
-            f.seek(self.position)
-            text = f.read()
-            self.position = f.tell()
-        lines = text.splitlines()
-        for line in lines:
-            scene_match = SCENE_RE.search(line)
-            if scene_match:
-                self.latest_scene = int(scene_match.group(1))
-                self.scene_revision += 1
-            match = COMBAT_RE.search(line)
-            if not match:
-                continue
-            scene = int(match.group(2))
-            target = int(match.group(3))
-            hp = int(match.group(4))
-            life = match.group(5)
-            self.latest_scene = scene
-            if target == self.boss_entity_id:
-                self.boss_seen = True
-                if hp == 0 or life == "LifeDead":
-                    self.boss_dead = True
-        return lines
-
-
-def resolve_log_path(configured_path: str, window: GameWindow) -> Path:
-    """Resolve Player.log, using the running game's directory for portable installs."""
-    if str(configured_path).strip().lower() != "auto":
-        return Path(configured_path).resolve()
-
-    executable = window.executable_path()
-    candidates = (
-        executable.parent / "Logs" / "Player.log",
-        executable.parent / "Player.log",
-    )
-    for candidate in candidates:
-        if candidate.is_file():
-            logging.info("已根据游戏进程自动找到日志：%s", candidate)
-            return candidate
-    checked = "、".join(str(path) for path in candidates)
-    raise FileNotFoundError(
-        f"已找到游戏 {executable}，但没有找到 Player.log（检查过：{checked}）。"
-        "可在 config.json 的 log_path 中填写实际路径。"
-    )
-
-
 class FatigueOCR:
     def __init__(self, debug_cfg: Optional[dict] = None) -> None:
         import easyocr
@@ -604,14 +545,45 @@ class FatigueOCR:
         self.debug_cfg = debug_cfg or {}
         self.last_debug_save = 0.0
 
-    def _save_failure(self, crop: np.ndarray) -> None:
+    def _save_failure(
+        self,
+        frame: np.ndarray,
+        crop: np.ndarray,
+        region: list[float],
+        value_region: list[float],
+    ) -> None:
         now = time.time()
         min_interval = float(self.debug_cfg.get("ocr_failure_min_interval_seconds", 60))
         if now - self.last_debug_save < min_interval:
             return
         self.last_debug_save = now
         DEBUG_DIR.mkdir(exist_ok=True)
-        cv2.imwrite(str(DEBUG_DIR / f"ocr_failed_{int(now)}.png"), crop)
+        # Keep the full frame as the main failure image. The old implementation
+        # saved only a crop, which made a hover/DPI failure look like a bad OCR
+        # region because the fatigue UI was not visible at all.
+        annotated = frame.copy()
+        height, width = annotated.shape[:2]
+        for bounds, color, label in (
+            (region, (0, 255, 255), "ocr_region"),
+            (value_region, (0, 0, 255), "value_region"),
+        ):
+            x1, y1, x2, y2 = bounds
+            start = (int(x1 * width), int(y1 * height))
+            end = (int(x2 * width), int(y2 * height))
+            cv2.rectangle(annotated, start, end, color, 2)
+            cv2.putText(
+                annotated,
+                label,
+                (start[0], max(18, start[1] - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+        stamp = int(now)
+        cv2.imwrite(str(DEBUG_DIR / f"ocr_failed_{stamp}.png"), annotated)
+        cv2.imwrite(str(DEBUG_DIR / f"ocr_failed_{stamp}_crop.png"), crop)
         limit = max(1, int(self.debug_cfg.get("max_ocr_failure_images", 20)))
         images = sorted(
             DEBUG_DIR.glob("ocr_failed_*.png"),
@@ -651,11 +623,76 @@ class FatigueOCR:
             allowlist="0123456789/-:",
         )
 
+    def _recognize_fatigue_number(self, image: np.ndarray) -> tuple[Optional[int], list[str]]:
+        """Read only the numeric field and prefer a high-confidence valid fraction."""
+        enlarged = cv2.resize(
+            image, None, fx=6.0, fy=6.0, interpolation=cv2.INTER_CUBIC
+        )
+        results = self.reader.readtext(
+            enlarged,
+            detail=1,
+            paragraph=False,
+            allowlist="0123456789/-",
+        )
+        diagnostics: list[str] = []
+        candidates: list[tuple[float, int]] = []
+        for _box, text, confidence in results:
+            cleaned = str(text).replace(" ", "")
+            diagnostics.append(f"number:{cleaned}@{float(confidence):.2f}")
+            value = self._extract_value([cleaned])
+            if value is not None:
+                candidates.append((float(confidence), value))
+        if not candidates:
+            return None, diagnostics
+        # Do not let a long low-confidence string such as 3045/-1000 outweigh
+        # the short, high-confidence real value (for example 845/-1000).
+        return max(candidates, key=lambda item: item[0])[1], diagnostics
+
+    def _recognize_threshold_fatigue_number(
+        self, enlarged_tooltip_crop: np.ndarray
+    ) -> tuple[Optional[int], list[str]]:
+        """Fallback for small tooltip text that EasyOCR merges with its outline."""
+        # The failed screenshot supplied during calibration shows that, at a
+        # virtualized 1024×576 capture, direct OCR reads "-425/-1000" as a long
+        # junk string. The caller enlarges the whole tooltip first (the same
+        # image saved as *_crop.png), then this pass thresholds its numeric
+        # sub-area to restore clean glyph edges.
+        height, width = enlarged_tooltip_crop.shape[:2]
+        # Relative to fatigue.ocr_region, so it remains stable if the game is
+        # captured at either logical or physical DPI resolution.
+        x1, y1, x2, y2 = (0.672, 0.239, 0.933, 0.331)
+        number = enlarged_tooltip_crop[
+            int(y1 * height):int(y2 * height),
+            int(x1 * width):int(x2 * width),
+        ]
+        if number.size == 0:
+            return None, []
+        gray = cv2.cvtColor(number, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+        recognized = self.reader.readtext(
+            cv2.resize(binary, None, fx=16.0, fy=16.0, interpolation=cv2.INTER_CUBIC),
+            detail=1,
+            paragraph=False,
+            allowlist="0123456789/-",
+        )
+        diagnostics: list[str] = []
+        candidates: list[tuple[float, int]] = []
+        for _box, text, confidence in recognized:
+            cleaned = str(text).replace(" ", "")
+            diagnostics.append(f"binary:{cleaned}@{float(confidence):.2f}")
+            value = self._extract_value([cleaned])
+            if value is not None:
+                candidates.append((float(confidence), value))
+        if not candidates:
+            return None, diagnostics
+        return max(candidates, key=lambda item: item[0])[1], diagnostics
+
     def read(
         self,
         frame: np.ndarray,
         region: list[float],
         value_region: Optional[list[float]] = None,
+        number_region: Optional[list[float]] = None,
     ) -> tuple[Optional[int], list[str]]:
         crop = self._crop(frame, region)
         if crop.size == 0:
@@ -665,9 +702,23 @@ class FatigueOCR:
         # 灰色说明文字和冰面背景；这对 989/1000、805/1000 一类红字明显更稳。
         if value_region is None:
             value_region = [0.895, 0.785, 0.998, 0.835]
+        if number_region is None:
+            number_region = [0.945, 0.785, 0.998, 0.835]
         value_crop = self._crop(frame, value_region)
         diagnostic_texts: list[str] = []
         candidates: list[int] = []
+        number_crop = self._crop(frame, number_region)
+        if number_crop.size:
+            direct_value, direct_texts = self._recognize_fatigue_number(number_crop)
+            diagnostic_texts.extend(direct_texts)
+            if direct_value is not None:
+                return direct_value, diagnostic_texts
+        threshold_value, threshold_texts = self._recognize_threshold_fatigue_number(
+            cv2.resize(crop, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+        )
+        diagnostic_texts.extend(threshold_texts)
+        if threshold_value is not None:
+            return threshold_value, diagnostic_texts
         if value_crop.size:
             red = value_crop[:, :, 2].astype(np.float32)
             green_blue = np.maximum(value_crop[:, :, 1], value_crop[:, :, 0]).astype(
@@ -702,9 +753,70 @@ class FatigueOCR:
             )[1]
             return selected, diagnostic_texts
         self._save_failure(
-            cv2.resize(crop, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+            frame,
+            cv2.resize(crop, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC),
+            region,
+            value_region,
         )
         return None, diagnostic_texts
+
+
+class AsyncFatigueOCR:
+    """在单独工作线程中运行 EasyOCR，主循环不等待模型推理。"""
+
+    def __init__(self, debug_cfg: Optional[dict] = None) -> None:
+        self.debug_cfg = debug_cfg or {}
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fatigue-ocr")
+        self._reader: Optional[FatigueOCR] = None
+        self._future: Optional[Future[tuple[Optional[int], list[str]]]] = None
+
+    def request(
+        self,
+        frame: np.ndarray,
+        region: list[float],
+        value_region: Optional[list[float]] = None,
+        number_region: Optional[list[float]] = None,
+    ) -> bool:
+        # 串行化 EasyOCR：同一时刻只保留一帧，避免旧帧堆积和多个 torch 推理并发。
+        if self._future is not None:
+            return False
+        snapshot = frame.copy()
+        self._future = self._executor.submit(
+            self._read_snapshot, snapshot, list(region),
+            list(value_region) if value_region is not None else None,
+            list(number_region) if number_region is not None else None,
+        )
+        return True
+
+    def _read_snapshot(
+        self,
+        frame: np.ndarray,
+        region: list[float],
+        value_region: Optional[list[float]],
+        number_region: Optional[list[float]],
+    ) -> tuple[Optional[int], list[str]]:
+        if self._reader is None:
+            # 模型首次加载同样留在工作线程，启动/战斗输入不会被 torch 初始化卡住。
+            self._reader = FatigueOCR(self.debug_cfg)
+        return self._reader.read(frame, region, value_region, number_region)
+
+    def poll(self) -> Optional[tuple[Optional[int], list[str]]]:
+        future = self._future
+        if future is None or not future.done():
+            return None
+        self._future = None
+        try:
+            return future.result()
+        except Exception:
+            logging.exception("疲劳 OCR 工作线程失败；本次结果已丢弃。")
+            return None
+
+    @property
+    def busy(self) -> bool:
+        return self._future is not None
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 class Bot:
@@ -743,50 +855,10 @@ class Bot:
             capture_mode=str(window_cfg.get("capture_mode", "screen")),
         )
         self.window.locate()
-        resolved_log_path = resolve_log_path(cfg.get("log_path", "auto"), self.window)
-        self.log_tail = LogTail(
-            str(resolved_log_path),
-            boss_entity_id=int(cfg.get("combat", {}).get("boss_entity_id", 100043)),
-        )
-        self.log_tail.start_at_end()
-        self.runtime_probe: Optional[MonoRuntimeProbe] = None
-        self._monster_death_log_state: dict[int, tuple[float, int]] = {}
-        combat_cfg = cfg.get("combat", {})
-        dark_cfg = cfg.get("dark_boss", {})
-        configured_boss_ids = combat_cfg.get(
-            "boss_monster_ids",
-            [combat_cfg.get("boss_monster_id", 10005)],
-        )
-        if not isinstance(configured_boss_ids, (list, tuple, set)):
-            configured_boss_ids = [configured_boss_ids]
-        tracked_boss_ids = [int(monster_id) for monster_id in configured_boss_ids]
-        dark_boss_id = dark_cfg.get("monster_id")
-        if dark_boss_id is not None:
-            tracked_boss_ids.append(int(dark_boss_id))
-        tracked_boss_ids = list(dict.fromkeys(tracked_boss_ids))
-        dark_hp_probe_required = (
-            mode == "dungeon"
-            and bool(dark_cfg.get("enabled", False))
-            and str(dark_cfg.get("identification_mode", "image")).lower()
-            == "runtime_hp"
-        )
-        if (
-            (
-                str(combat_cfg.get("boss_death_detection_mode", "log_first")).lower()
-                == "runtime_first"
-                or dark_hp_probe_required
-            )
-            and bool(combat_cfg.get("runtime_probe_enabled", True))
-        ):
-            self.runtime_probe = MonoRuntimeProbe(
-                self.window.process_id(),
-                int(combat_cfg.get("boss_monster_id", 10005)),
-                MONO_PROBE_SCRIPT,
-                boss_monster_ids=tracked_boss_ids,
-            )
-            self.runtime_probe.start()
-        # OCR 模型占用明显高于其余模块；延迟到完整闭环真正读取疲劳时再加载。
-        self.ocr: Optional[FatigueOCR] = None
+        # v0.0.3 只使用画面：不附加进程，也不读取游戏日志。
+        # EasyOCR 在后台单线程按截图推理；主循环只负责短暂刷新提示框和取帧。
+        self.ocr = AsyncFatigueOCR(self.cfg.get("debug"))
+        self._next_fatigue_request = 0.0
         self.portal_template = self._load_gray_template("portal.png")
         self.panel_template = self._load_gray_template("entry_panel_title.png")
         self.map_template = self._load_gray_template("map_open_indicator.png")
@@ -866,32 +938,8 @@ class Bot:
             return
         self._window_reconnect_epoch = self.window.reconnect_epoch
         self.window.release_keys(("A", "SPACE"), live=self.live)
-        recovery_cfg = self.cfg.get("recovery", {})
-        confirm_seconds = max(
-            0.0, float(recovery_cfg.get("scene_confirm_seconds", 3.0))
-        )
-        initial_revision = self.log_tail.scene_revision
-        deadline = time.monotonic() + confirm_seconds
-        while time.monotonic() < deadline and not self.stopped:
-            self.log_tail.poll()
-            if self.log_tail.scene_revision > initial_revision:
-                break
-            self.check_control_keys()
-            time.sleep(0.2)
-
-        scene = self.log_tail.latest_scene
-        normal_scene = int(self.cfg.get("scenes", {}).get("normal_scene_id", 1002))
-        if scene is None:
-            logging.warning(
-                "游戏窗口已恢复，但日志暂时没有场景记录；保持阶段 %s 并在后续流程中继续验证。",
-                self.phase,
-            )
-            return
-        scene_kind = "普通场景" if scene == normal_scene else "副本场景"
         logging.warning(
-            "游戏窗口已恢复，日志确认最近场景为 %s（ID %s），当前阶段 %s。",
-            scene_kind,
-            scene,
+            "游戏窗口已恢复；已释放战斗按键，后续步骤将通过画面模板继续确认，当前阶段 %s。",
             self.phase,
         )
 
@@ -904,7 +952,6 @@ class Bot:
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             self.check_control_keys()
-            self.log_tail.poll()
             if self.stopped:
                 return False
             if not self.running:
@@ -1275,8 +1322,6 @@ class Bot:
         dark_cfg = self.cfg.get("dark_boss", {})
         if not bool(dark_cfg.get("enabled", False)):
             return True
-        if str(dark_cfg.get("identification_mode", "image")).lower() == "runtime_hp":
-            return self.confirm_dark_boss_by_runtime_hp()
         if self.dark_boss_template is None:
             logging.warning("暗黑鲨鱼模板不存在，本轮跳过目标过滤，避免误退出。")
             return True
@@ -1315,94 +1360,14 @@ class Bot:
             )
         return accepted
 
-    def confirm_dark_boss_by_runtime_hp(self) -> bool:
-        """只用 Mono 报告的 Boss 初始 HP 判断目标，避免蓝色外观误匹配。"""
-        dark_cfg = self.cfg.get("dark_boss", {})
-        expected_hp = int(dark_cfg.get("dark_max_hp", 26000))
-        normal_hp = int(dark_cfg.get("normal_max_hp", 18000))
-        timeout = max(
-            0.5,
-            float(
-                dark_cfg.get(
-                    "boss_runtime_hp_timeout_seconds",
-                    dark_cfg.get("runtime_hp_timeout_seconds", 6.0),
-                )
-            ),
+    def classify_dark_boss_after_entry(self) -> bool:
+        """进入副本后仅依据暗黑鲨鱼外观模板过滤目标。"""
+        accepted = self.confirm_dark_boss()
+        logging.info(
+            "进入副本视觉目标判定：%s。",
+            "暗黑鲨鱼" if accepted else "未匹配暗黑鲨鱼",
         )
-        hp = self.read_runtime_boss_hp(timeout, "Boss 点")
-        if hp == expected_hp:
-            logging.info("已确认当前副本为暗黑鲨鱼，继续战斗。")
-            return True
-        if hp == normal_hp:
-            logging.info("已确认当前副本为普通 Boss，准备退出。")
-            return False
-        return False
-
-    def classify_dark_boss_after_entry(self) -> Optional[bool]:
-        """进入副本后立即读取 HP；True=暗黑鲨鱼，False=普通 Boss，None=超时/未知。"""
-        dark_cfg = self.cfg.get("dark_boss", {})
-        expected_hp = int(dark_cfg.get("dark_max_hp", 26000))
-        normal_hp = int(dark_cfg.get("normal_max_hp", 18000))
-        timeout = max(
-            0.5,
-            float(
-                dark_cfg.get(
-                    "entry_runtime_hp_timeout_seconds",
-                    dark_cfg.get("runtime_hp_timeout_seconds", 6.0),
-                )
-            ),
-        )
-        hp = self.read_runtime_boss_hp(timeout, "进入副本")
-        if hp == expected_hp:
-            logging.info("进入副本已确认暗黑鲨鱼：最大 HP=%s。", hp)
-            return True
-        if hp == normal_hp:
-            logging.info("进入副本已确认普通 Boss：最大 HP=%s。", hp)
-            return False
-        if hp is not None:
-            logging.warning(
-                "进入副本读取到未知 Boss HP=%s（目标=%s，普通=%s），本轮安全退出。",
-                hp,
-                expected_hp,
-                normal_hp,
-            )
-        return None
-
-    def read_runtime_boss_hp(
-        self, timeout: float, context: str
-    ) -> Optional[int]:
-        """等待并返回当前 Boss 的最大 HP；只读 Mono，不使用画面猜测。"""
-        if self.runtime_probe is None:
-            logging.error(
-                "%s读取要求 Mono HP 判定，但运行时探针不可用。", context
-            )
-            return None
-        deadline = time.monotonic() + timeout
-        last_hp: Optional[int] = None
-        while time.monotonic() < deadline and not self.stopped:
-            snapshot = self.runtime_probe.snapshot()
-            hp = snapshot.get("latest_max_hp")
-            if hp is None:
-                hp = snapshot.get("latest_hp")
-            if hp is not None:
-                last_hp = int(hp)
-                logging.info(
-                    "Mono %s读取 Boss：MonsterId=%s，HP=%s"
-                    "（暗黑鲨鱼目标=%s，普通 Boss=%s）。",
-                    context,
-                    snapshot.get("latest_monster_id"),
-                    last_hp,
-                    self.cfg.get("dark_boss", {}).get("dark_max_hp", 26000),
-                    self.cfg.get("dark_boss", {}).get("normal_max_hp", 18000),
-                )
-                return last_hp
-            self.wait(0.1)
-        logging.warning(
-            "等待 Mono %s Boss HP 超时（最后读数=%s）。",
-            context,
-            last_hp,
-        )
-        return None
+        return accepted
 
     def panel_visible(self) -> bool:
         _, score = self.template_match(self.capture_frame(), self.panel_template)
@@ -2005,144 +1970,98 @@ class Bot:
                     return
         raise RuntimeError("绕入口移动后仍未检测到副本面板。")
 
+    def poll_fatigue_result(self) -> Optional[int]:
+        """取走已完成的后台 OCR 结果；绝不在这里等待 EasyOCR。"""
+        result = self.ocr.poll()
+        if result is None:
+            return None
+        value, texts = result
+        logging.info("疲劳 OCR（后台）: value=%s raw=%s", value, texts)
+        if value is None or not -1000 <= value <= 1000:
+            return None
+        self.last_fatigue = value
+        logging.info("确认当前疲劳值：%s/1000", value)
+        return value
+
+    def request_fatigue_read(self) -> bool:
+        """刷新提示框并提交一帧给后台 OCR；推理期间战斗继续运行。"""
+        if self.ocr.busy:
+            return False
+        fatigue_cfg = self.cfg["fatigue"]
+        hover = self.window.normalized_to_client(fatigue_cfg["hover_point"])
+        refresh = self.window.normalized_to_client(
+            fatigue_cfg.get("refresh_point", [0.5, 0.5])
+        )
+        self._confirm_reconnected_window()
+        revive_epoch = self.revive_epoch
+
+        # 只有生成/刷新 tooltip 时需要一次短暂鼠标会话；EasyOCR 本身在工作线程。
+        with self.window.input_session(live=self.live):
+            self.window.move_client(*refresh, live=self.live)
+            if not self.wait(float(fatigue_cfg.get("refresh_leave_seconds", 0.25))):
+                return False
+            self.window.move_client(*hover, live=self.live)
+            if not self.wait(float(fatigue_cfg.get("hover_settle_seconds", 0.8))):
+                return False
+            if self.revive_epoch != revive_epoch:
+                logging.info("刷新疲劳提示框期间发生复活，本次 OCR 请求取消。")
+                return False
+            # Unity 的 PrintWindow 截图会遗漏底部 HUD/Canvas；疲劳提示框
+            # 正处于这一小段前台会话中，因此专门使用屏幕截图提交给 OCR。
+            frame = self.window.capture_screen()
+            self._confirm_reconnected_window()
+
+        submitted = self.ocr.request(
+            frame,
+            fatigue_cfg["ocr_region"],
+            fatigue_cfg.get("value_region"),
+            fatigue_cfg.get("number_region"),
+        )
+        if submitted:
+            logging.debug("已提交疲劳截图给后台 OCR。")
+        return submitted
+
     def read_fatigue(
         self, attempts: int = 3, refresh_rounds: int = 1
     ) -> Optional[int]:
-        if self.ocr is None:
-            self.ocr = FatigueOCR(self.cfg.get("debug"))
+        """在非战斗关口等待后台 OCR；推理仍不占用主输入循环。"""
         fatigue_cfg = self.cfg["fatigue"]
-        refresh_rounds = max(1, int(refresh_rounds))
-        for refresh_round in range(1, refresh_rounds + 1):
-            hover = self.window.normalized_to_client(fatigue_cfg["hover_point"])
-            refresh = self.window.normalized_to_client(
-                fatigue_cfg.get("refresh_point", [0.5, 0.5])
-            )
-            self._confirm_reconnected_window()
-            revive_epoch = self.revive_epoch
-
-            # 疲劳提示依赖真实鼠标。焦点脉冲模式将整次“移出、移回、
-            # OCR”放在同一个短会话中，识别完成后一次性恢复用户窗口。
-            with self.window.input_session(live=self.live):
-                self.window.move_client(*refresh, live=self.live)
-                if not self.wait(
-                    float(fatigue_cfg.get("refresh_leave_seconds", 0.25))
-                ):
-                    return None
-                if self.revive_epoch != revive_epoch:
-                    return self.read_fatigue(
-                        attempts=attempts, refresh_rounds=refresh_rounds
-                    )
-                self.window.move_client(*hover, live=self.live)
-                if not self.wait(
-                    float(fatigue_cfg.get("hover_settle_seconds", 0.8))
-                ):
-                    return None
-                if self.revive_epoch != revive_epoch:
-                    return self.read_fatigue(
-                        attempts=attempts, refresh_rounds=refresh_rounds
-                    )
-
-                values: list[int] = []
-                for _ in range(attempts):
-                    frame = self.capture_frame()
-                    value, texts = self.ocr.read(
-                        frame,
-                        fatigue_cfg["ocr_region"],
-                        fatigue_cfg.get("value_region"),
-                    )
-                    logging.info("疲劳 OCR: value=%s raw=%s", value, texts)
-                    if value is not None and -1000 <= value <= 1000:
-                        values.append(value)
-                    if not self.wait(0.25):
-                        return None
-            if values:
-                values.sort()
-                value = values[len(values) // 2]
-                self.last_fatigue = value
-                logging.info("确认当前疲劳值：%s/1000", value)
-                return value
-            if refresh_round < refresh_rounds:
+        rounds = max(1, int(refresh_rounds))
+        # 预留模型首次加载及慢机器 CPU 推理时间；可在配置中覆盖。
+        timeout = max(2.0, float(fatigue_cfg.get("result_timeout_seconds", 20.0)))
+        for round_index in range(1, rounds + 1):
+            if not self.ocr.busy:
+                self.request_fatigue_read()
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline and not self.stopped:
+                value = self.poll_fatigue_result()
+                if value is not None:
+                    return value
+                self.wait(0.05)
+            if round_index < rounds:
                 logging.warning(
-                    "疲劳 OCR 第 %s/%s 轮未识别成功，将重新移出并移回状态栏。",
-                    refresh_round,
-                    refresh_rounds,
+                    "疲劳 OCR 第 %s/%s 轮未得到有效结果，将重新刷新提示框。",
+                    round_index,
+                    rounds,
                 )
-                if not self.wait(
-                    float(fatigue_cfg.get("ocr_retry_interval_seconds", 0.5))
-                ):
+                if not self.wait(float(fatigue_cfg.get("ocr_retry_interval_seconds", 0.5))):
                     return None
-        logging.warning("疲劳 OCR 连续 %s 轮均未识别成功。", refresh_rounds)
-        return None
-
-    def runtime_fatigue(self) -> Optional[int]:
-        if self.runtime_probe is None:
-            return None
-        snapshot = self.runtime_probe.snapshot()
-        if not snapshot.get("available") or snapshot.get("latest_fatigue") is None:
-            return None
-        stale_seconds = max(
-            30.0,
-            float(
-                self.cfg["fatigue"].get(
-                    "runtime_stale_fallback_seconds", 180.0
-                )
-            ),
-        )
-        fatigue_age = snapshot.get("fatigue_age_seconds")
-        if fatigue_age is not None and float(fatigue_age) >= stale_seconds:
-            return None
-        value = int(snapshot["latest_fatigue"])
-        if -1000 <= value <= 1000:
-            self.last_fatigue = value
-            return value
+        logging.warning("疲劳 OCR 连续 %s 轮均未识别成功。", rounds)
         return None
 
     def read_fatigue_preferred(
         self, attempts: int = 3, refresh_rounds: int = 1
     ) -> Optional[int]:
-        if self.runtime_probe is not None:
-            snapshot = self.runtime_probe.snapshot()
-            if snapshot.get("available"):
-                stale_seconds = max(
-                    30.0,
-                    float(
-                        self.cfg["fatigue"].get(
-                            "runtime_stale_fallback_seconds", 180.0
-                        )
-                    ),
-                )
-                provider_age = snapshot.get("fatigue_age_seconds")
-                if provider_age is None:
-                    provider_age = snapshot.get("ready_age_seconds")
-                if provider_age is None or float(provider_age) < stale_seconds:
-                    value = self.runtime_fatigue()
-                    if value is not None:
-                        logging.debug("使用 Mono 运行时疲劳值：%s/1000。", value)
-                        return value
-                    logging.debug(
-                        "Mono 运行时已连接但尚无新疲劳值；"
-                        "保持无 OCR 监测。"
-                    )
-                    return None
-                logging.warning(
-                    "Mono 疲劳数据已超过 %.0f 秒未更新，本次降级为 OCR。",
-                    stale_seconds,
-                )
-            else:
-                logging.warning("Mono 运行时不可用，本次降级为 OCR。")
-        if not bool(self.cfg.get("combat", {}).get("easyocr_enabled", False)):
-            logging.warning("EasyOCR 未启用，跳过疲劳 OCR 备用识别。")
-            return None
+        # v0.0.3 没有运行时/日志提供器；疲劳只来自游戏画面 OCR。
         return self.read_fatigue(attempts=attempts, refresh_rounds=refresh_rounds)
 
     def normal_farm_until_low(self) -> None:
-        logging.info("状态：普通区域挂机。")
+        logging.info("状态：普通区域挂机（纯视觉疲劳监测）。")
         self.set_phase("normal_combat", combat=True)
         schedule = self.new_combat_schedule(boss=False)
         next_fatigue = 0.0
         while not self.stopped:
             self.check_control_keys()
-            self.log_tail.poll()
             if not self.running:
                 time.sleep(0.05)
                 continue
@@ -2158,24 +2077,16 @@ class Bot:
             if self.check_and_handle_revive():
                 schedule = self.new_combat_schedule(boss=False)
                 continue
-            now = time.monotonic()
             self.run_due_combat_inputs(schedule)
-            runtime_fatigue = self.runtime_fatigue()
-            if (
-                runtime_fatigue is not None
-                and runtime_fatigue <= self.cfg["fatigue"]["low_threshold"]
-            ):
-                logging.warning(
-                    "Mono 疲劳 %s 低于阈值，转入 BOSS 循环。",
-                    runtime_fatigue,
-                )
+            fatigue = self.poll_fatigue_result()
+            if fatigue is not None and fatigue <= self.cfg["fatigue"]["low_threshold"]:
+                logging.warning("疲劳 %s 低于阈值，转入 BOSS 循环。", fatigue)
                 return
-            if now >= next_fatigue:
-                fatigue = self.read_fatigue_preferred()
-                next_fatigue = now + self.cfg["fatigue"]["check_interval_seconds"]
-                if fatigue is not None and fatigue <= self.cfg["fatigue"]["low_threshold"]:
-                    logging.warning("疲劳 %s 低于阈值，转入 BOSS 循环。", fatigue)
-                    return
+            now = time.monotonic()
+            if now >= next_fatigue and self.request_fatigue_read():
+                next_fatigue = now + float(
+                    self.cfg["fatigue"]["check_interval_seconds"]
+                )
             time.sleep(0.03)
 
     def travel_to_first_entrance(self) -> None:
@@ -2216,10 +2127,6 @@ class Bot:
         logging.info("状态：触发入口并进入冰牙海湾。")
         self.set_phase("entering_dungeon")
         self._dungeon_exit_started = False
-        if self.runtime_probe is not None:
-            # 在新副本实体生成前清除上一轮状态；Boss.OnShow 随后的事件会
-            # 重新建立本轮目标，不能等到开战时再把它清掉。
-            self.runtime_probe.reset_boss_state()
         self.trigger_entrance_panel()
         self.click("enter_dungeon_button")
         self.wait(self.cfg["timing"]["dungeon_load_seconds"])
@@ -2241,59 +2148,13 @@ class Bot:
             self.exit_dungeon()
             return False
 
-    def wait_for_scene(
-        self,
-        expected: str,
-        timeout: float,
-        *,
-        runtime_scene_revision: Optional[int] = None,
-        log_scene_revision: Optional[int] = None,
-    ) -> bool:
-        """等待真实场景来源确认目标场景；phase 本身不参与确认。"""
-        normal_scene = int(self.cfg.get("scenes", {}).get("normal_scene_id", 1002))
-        runtime_start = (
-            runtime_scene_revision
-            if runtime_scene_revision is not None
-            else (
-                self.runtime_probe.snapshot().get("scene_revision", 0)
-                if self.runtime_probe is not None
-                else 0
-            )
-        )
-        log_start = (
-            log_scene_revision
-            if log_scene_revision is not None
-            else self.log_tail.scene_revision
-        )
-        deadline = time.monotonic() + max(0.5, float(timeout))
-        while time.monotonic() < deadline and not self.stopped:
-            self.log_tail.poll()
-            if self.runtime_probe is not None:
-                snapshot = self.runtime_probe.snapshot()
-                if snapshot.get("scene_revision", 0) > runtime_start:
-                    scene_id = snapshot.get("latest_scene_id")
-                    if scene_id is not None:
-                        is_normal = int(scene_id) == normal_scene
-                        if (expected == "normal") == is_normal:
-                            logging.info(
-                                "Mono 已确认当前场景：%s（SceneId=%s）。",
-                                "普通场景" if is_normal else "副本场景",
-                                scene_id,
-                            )
-                            return True
-            if self.log_tail.scene_revision > log_start:
-                scene_id = self.log_tail.latest_scene
-                if scene_id is not None:
-                    is_normal = int(scene_id) == normal_scene
-                    if (expected == "normal") == is_normal:
-                        logging.info(
-                            "日志已确认当前场景：%s（SceneId=%s）。",
-                            "普通场景" if is_normal else "副本场景",
-                            scene_id,
-                        )
-                        return True
-            self.wait(0.1)
-        return False
+    def wait_for_scene(self, expected: str, timeout: float) -> bool:
+        """纯视觉场景确认：退出加载页完整出现并消失才算完成。"""
+        if expected != "normal":
+            return False
+        if not self.wait_for_exit_loading_start(max(0.5, float(timeout) / 2)):
+            return False
+        return self.wait_for_exit_loading_end(max(1.0, float(timeout)))
 
     def wait_navigation_with_mount(
         self,
@@ -2442,75 +2303,25 @@ class Bot:
         logging.info("已到达刷怪点，恢复普通刷怪。")
 
     def fight_boss(self) -> bool:
-        logging.info("状态：寻找并攻击 BOSS。")
+        """持续战斗，并以疲劳值恢复作为唯一的 Boss 死亡信号。"""
+        logging.info("状态：寻找并攻击 BOSS（纯视觉疲劳死亡判定）。")
         self.set_phase("boss_combat", combat=True)
-        self.log_tail.boss_seen = False
-        self.log_tail.boss_dead = False
         combat_cfg = self.cfg["combat"]
-        detection_mode = str(
-            combat_cfg.get("boss_death_detection_mode", "log_first")
-        ).strip().lower()
-        valid_detection_modes = {"runtime_first", "log_first", "log_only", "ocr_only"}
-        if detection_mode not in valid_detection_modes:
-            raise ValueError(
-                "combat.boss_death_detection_mode 必须是 "
-                "runtime_first、log_first、log_only 或 ocr_only"
+        fatigue_gain_threshold = max(
+            1, int(combat_cfg.get("boss_fatigue_gain_threshold", 80))
+        )
+        if self.mode == "dungeon":
+            fatigue_gain_threshold = max(
+                1,
+                int(
+                    self.cfg.get("dark_boss", {}).get(
+                        "boss_fatigue_gain_threshold", fatigue_gain_threshold
+                    )
+                ),
             )
-        runtime_snapshot = (
-            self.runtime_probe.snapshot() if self.runtime_probe is not None else {}
+        confirm_samples = max(
+            1, int(combat_cfg.get("boss_fatigue_confirm_samples", 2))
         )
-        runtime_hp_available = (
-            runtime_snapshot.get("latest_hp") is not None
-            or runtime_snapshot.get("latest_max_hp") is not None
-        )
-        runtime_detection_enabled = bool(runtime_snapshot.get("available")) and (
-            detection_mode == "runtime_first"
-        )
-        if runtime_detection_enabled and not runtime_hp_available:
-            logging.warning(
-                "本轮 Mono 尚未提供 Boss HP；不把 None 当作离开副本，"
-                "改由死亡事件或战斗超时兜底。"
-            )
-        log_detection_enabled = detection_mode in {
-            "runtime_first",
-            "log_first",
-            "log_only",
-        }
-        fatigue_fallback_enabled = detection_mode in {
-            "runtime_first",
-            "log_first",
-            "ocr_only",
-        }
-        # 兼容旧配置中的总开关；显式 false 只关闭 OCR 提供器，不影响日志。
-        fatigue_fallback_enabled = fatigue_fallback_enabled and bool(
-            combat_cfg.get("boss_fatigue_fallback_enabled", True)
-        )
-        fatigue_fallback_enabled = fatigue_fallback_enabled and bool(
-            combat_cfg.get("easyocr_enabled", False)
-        )
-        # Mono 能读取后，BOSS 死亡由 OnDead/HP/日志确认，战斗中
-        # 不再定时加载 EasyOCR。只有探针本身不可用时才允许 OCR 兜底。
-        fatigue_fallback_enabled = (
-            fatigue_fallback_enabled and not runtime_detection_enabled
-        )
-        logging.info(
-            "BOSS 死亡检测模式：%s（Mono运行时=%s，日志=%s，OCR兜底=%s）。",
-            detection_mode,
-            "启用" if runtime_detection_enabled else "不可用/关闭",
-            "启用" if log_detection_enabled else "关闭",
-            "启用" if fatigue_fallback_enabled else "关闭",
-        )
-        fatigue_baseline = self.last_fatigue
-        if (
-            fatigue_fallback_enabled
-            and fatigue_baseline is None
-            and not runtime_detection_enabled
-        ):
-            logging.info("尚无战前疲劳基准，先读取一次用于 BOSS 死亡兜底判断。")
-            fatigue_baseline = self.read_fatigue(attempts=3, refresh_rounds=1)
-        runtime_fatigue_baseline = runtime_snapshot.get("latest_fatigue")
-        if runtime_fatigue_baseline is not None:
-            runtime_fatigue_baseline = int(runtime_fatigue_baseline)
         fatigue_probe_delay = max(
             1.0,
             float(combat_cfg.get("boss_fatigue_probe_initial_delay_seconds", 12.0)),
@@ -2519,139 +2330,81 @@ class Bot:
             1.0,
             float(combat_cfg.get("boss_fatigue_probe_interval_seconds", 8.0)),
         )
-        fatigue_gain_threshold = max(
-            1,
-            int(combat_cfg.get("boss_fatigue_gain_threshold", 40)),
+
+        # 进入 BOSS 恢复循环前的普通挂机读数才是最可靠的战前基准。若在
+        # 副本内先等待 OCR，Boss 可能已死亡并恢复疲劳，第一条有效读数会把
+        # “击杀后的值”错误地当作基准，进而只能等到超时。
+        fatigue_baseline = self.last_fatigue
+        if fatigue_baseline is None:
+            # 极少数情况下完整循环不是由普通挂机切入，才退回到副本内读取。
+            fatigue_baseline = self.read_fatigue(attempts=1, refresh_rounds=1)
+        if fatigue_baseline is None:
+            logging.warning("本场 Boss 暂无疲劳基准；收到第一条有效视觉结果后再建立基准。")
+        else:
+            logging.info("本场 Boss 沿用进入副本前的视觉疲劳基准：%s。", fatigue_baseline)
+        logging.info(
+            "BOSS 死亡仅使用疲劳变化：增量阈值=%s，连续确认=%s 次，采样间隔=%.1f 秒。",
+            fatigue_gain_threshold,
+            confirm_samples,
+            fatigue_probe_interval,
         )
-        if self.mode == "dungeon":
-            # 黑鲨模式的 Mono HP 经常是 None，使用更保守的疲劳增量作为
-            # 击杀兜底，避免误判后过早退出。普通挂机保持原有阈值。
-            fatigue_gain_threshold = max(
-                1,
-                int(
-                    self.cfg.get("dark_boss", {}).get(
-                        "boss_fatigue_gain_threshold", 80
-                    )
-                ),
-            )
-            logging.info(
-                "暗黑鲨鱼模式疲劳增量兜底阈值：%s。",
-                fatigue_gain_threshold,
-            )
+
         next_fatigue_probe = time.monotonic() + fatigue_probe_delay
         deadline = time.monotonic() + self.cfg["timing"]["boss_timeout_seconds"]
         revive_epoch = self.revive_epoch
+        confirmed_hits = 0
         schedule = self.new_combat_schedule(boss=True)
         while time.monotonic() < deadline and not self.stopped:
             if self.check_and_handle_revive():
                 deadline = time.monotonic() + self.cfg["timing"]["boss_timeout_seconds"]
                 revive_epoch = self.revive_epoch
+                fatigue_baseline = None
+                confirmed_hits = 0
+                next_fatigue_probe = time.monotonic() + fatigue_probe_delay
                 schedule = self.new_combat_schedule(boss=True)
                 continue
             self.run_due_combat_inputs(schedule)
-            if runtime_detection_enabled and self.runtime_probe is not None:
-                runtime_snapshot = self.runtime_probe.snapshot()
-                if runtime_snapshot.get("boss_dead"):
-                    logging.info(
-                        "Mono 运行时确认 BOSS 已死亡（%s）。",
-                        runtime_snapshot.get("death_source"),
-                    )
-                    return True
-                runtime_hp = runtime_snapshot.get("latest_hp")
-                if (
-                    runtime_snapshot.get("boss_seen")
-                    and runtime_hp is not None
-                    and int(runtime_hp) <= 0
-                ):
-                    logging.info("Mono 运行时读取 Boss 当前 HP=0，确认 BOSS 已死亡。")
-                    return True
-                runtime_fatigue = runtime_snapshot.get("latest_fatigue")
-                if runtime_fatigue is not None:
-                    runtime_fatigue = int(runtime_fatigue)
-                    if runtime_fatigue_baseline is None:
-                        # 探针可能在进入副本后才收到第一条疲劳更新；
-                        # 第一条只建立基准，避免把旧值/首条值误算成击杀。
-                        runtime_fatigue_baseline = runtime_fatigue
-                        logging.info(
-                            "已建立本场 Boss 疲劳基准：%s，等待后续疲劳更新。",
-                            runtime_fatigue_baseline,
-                        )
-                    elif runtime_fatigue - runtime_fatigue_baseline >= fatigue_gain_threshold:
-                        logging.info(
-                            "HuntFatigueSyncEvent 从 %s "
-                            "恢复到 %s（增量 %s，阈值 %s）；确认 BOSS 已死亡。",
-                            runtime_fatigue_baseline,
-                            runtime_fatigue,
-                            runtime_fatigue - runtime_fatigue_baseline,
-                            fatigue_gain_threshold,
-                        )
-                        return True
-            self.log_tail.poll()
-            if log_detection_enabled and self.log_tail.boss_seen:
-                logging.info("日志已识别 BOSS 实体 %s。", self.cfg["combat"]["boss_entity_id"])
-            if log_detection_enabled and self.log_tail.boss_dead:
-                logging.info("日志确认 BOSS 已死亡。")
-                return True
-            now = time.monotonic()
-            if (
-                fatigue_fallback_enabled
-                and now >= next_fatigue_probe
-            ):
+
+            fatigue = self.poll_fatigue_result()
+            if fatigue is not None:
                 if fatigue_baseline is None:
-                    logging.warning(
-                        "Mono 运行时尚未确认死亡，开始加载 OCR 建立兜底基准。"
+                    fatigue_baseline = fatigue
+                    confirmed_hits = 0
+                    logging.info("已建立本场 Boss 视觉疲劳基准：%s。", fatigue_baseline)
+                elif fatigue - fatigue_baseline >= fatigue_gain_threshold:
+                    confirmed_hits += 1
+                    logging.info(
+                        "疲劳从 %s 到 %s（增量 %s，确认 %s/%s）。",
+                        fatigue_baseline,
+                        fatigue,
+                        fatigue - fatigue_baseline,
+                        confirmed_hits,
+                        confirm_samples,
                     )
-                    fatigue_baseline = self.read_fatigue(
-                        attempts=3, refresh_rounds=1
-                    )
-                    schedule = self.new_combat_schedule(boss=True)
-                    next_fatigue_probe = (
-                        time.monotonic() + fatigue_probe_interval
-                    )
-                    continue
-                # 某些游戏运行状态不再向 Player.log 输出战斗诊断。BOSS 击杀
-                # 仍会立即恢复约 100 点疲劳，因此用战前值作独立兜底。第一次
-                # 达到阈值后立刻再读一次，避免一次 OCR 误读导致提前退出。
-                fatigue = self.read_fatigue(attempts=3, refresh_rounds=1)
-                if (
-                    fatigue is not None
-                    and fatigue - fatigue_baseline >= fatigue_gain_threshold
-                ):
-                    confirmed_fatigue = self.read_fatigue(
-                        attempts=2, refresh_rounds=1
-                    )
-                    if (
-                        confirmed_fatigue is not None
-                        and confirmed_fatigue - fatigue_baseline
-                        >= fatigue_gain_threshold
-                    ):
-                        logging.info(
-                            "疲劳从 %s 恢复到 %s，连续两次确认增量达到 %s；"
-                            "判定 BOSS 已死亡。",
-                            fatigue_baseline,
-                            confirmed_fatigue,
-                            fatigue_gain_threshold,
-                        )
+                    if confirmed_hits >= confirm_samples:
+                        logging.info("疲劳恢复已连续确认，判定 BOSS 已死亡。")
                         return True
-                    logging.warning(
-                        "BOSS 疲劳增量第一次达到阈值，但复核值为 %s；"
-                        "继续战斗并等待下一轮确认。",
-                        confirmed_fatigue,
-                    )
-                # OCR 会占用数秒，重新建立调度，避免恢复战斗时一次性补发
-                # 已经过期的 A、Q、W、Space。
-                schedule = self.new_combat_schedule(boss=True)
+                else:
+                    if confirmed_hits:
+                        logging.info("疲劳复核未达阈值，撤销上一次死亡候选。")
+                    confirmed_hits = 0
+
+            now = time.monotonic()
+            if now >= next_fatigue_probe and not self.ocr.busy:
+                self.request_fatigue_read()
                 next_fatigue_probe = time.monotonic() + fatigue_probe_interval
             self.wait(0.03)
             if self.revive_epoch != revive_epoch:
                 deadline = time.monotonic() + self.cfg["timing"]["boss_timeout_seconds"]
                 revive_epoch = self.revive_epoch
+                fatigue_baseline = None
+                confirmed_hits = 0
                 next_fatigue_probe = time.monotonic() + fatigue_probe_delay
+
         if self.stopped:
             return False
         logging.warning(
-            "BOSS 战超时，启用的死亡检测来源均未确认击杀；"
-            "将退出本次副本并继续恢复流程。"
+            "BOSS 战超时，疲劳变化尚未连续确认击杀；将退出本次副本并继续恢复流程。"
         )
         return False
 
@@ -2725,12 +2478,6 @@ class Bot:
         )
         for attempt in range(1, attempts + 1):
             try:
-                runtime_scene_revision = (
-                    self.runtime_probe.snapshot().get("scene_revision", 0)
-                    if self.runtime_probe is not None
-                    else 0
-                )
-                log_scene_revision = self.log_tail.scene_revision
                 residual_dialog_timeout = min(0.5, confirm_timeout)
                 if self.wait_for_exit_confirm_dialog(residual_dialog_timeout):
                     logging.info(
@@ -2762,52 +2509,38 @@ class Bot:
                 if self.stopped:
                     return
                 self.click("confirm_exit_button")
-                # 实测退出成功后会先出现“场景切换中”加载页，但当前游戏版本
-                # 的 Mono 场景包没有稳定给出 SceneTid。先用加载页确认点击已
-                # 生效，确认后绝不能再次点击退出按钮。
+                # 纯视觉确认：加载页必须出现且消失；不再读取场景 ID 或日志。
                 if self.wait_for_exit_loading_start(
                     min(scene_timeout, max(2.0, confirm_timeout + 1.5))
                 ):
                     if self.wait_for_exit_loading_end(scene_timeout + exit_load):
                         self._dungeon_exit_started = True
-                        logging.info(
-                            "已通过场景加载画面确认退出副本，开始下一轮前置流程。"
-                        )
+                        logging.info("已通过加载画面确认退出副本，开始下一轮前置流程。")
                         return
                     raise RuntimeError(
-                        "已触发副本退出场景加载，但加载画面长时间未消失；"
+                        "已触发副本退出加载，但加载画面长时间未消失；"
                         "已暂停，避免重复点击退出按钮。"
                     )
+                logging.warning(
+                    "第 %s 次退出后未看到加载画面；不凭非视觉来源猜测场景，将重试。",
+                    attempt,
+                )
                 if not self.wait(exit_load):
                     return
-                if not self.wait_for_scene(
-                    "normal",
-                    scene_timeout,
-                    runtime_scene_revision=runtime_scene_revision,
-                    log_scene_revision=log_scene_revision,
-                ):
-                    logging.warning(
-                        "第 %s 次退出后未确认普通场景或完整加载；"
-                        "下一次将先检查残留确认弹窗，再决定重试确认还是完整退出。",
-                        attempt,
-                    )
-                    continue
-                self._dungeon_exit_started = True
-                logging.info("已确认退出副本并回到普通场景，开始下一轮前置流程。")
-                return
+                continue
             except Exception:
                 if attempt >= attempts:
                     # 允许上层记录真实异常，但不再吞掉退出失败原因。
                     logging.exception("退出副本点击流程失败。")
                     raise
                 logging.exception("退出副本点击流程第 %s 次失败，准备重试。", attempt)
-        raise RuntimeError(
-            "退出副本点击后未收到普通场景确认，已停止本轮，避免在副本内错进入下一轮。"
-        )
+        raise RuntimeError("退出副本点击后未收到加载画面确认，已停止本轮，避免在副本内错进入下一轮。")
 
     def boss_recovery_loop(self) -> None:
         completed_runs = 0
-        minimum_runs = max(1, int(self.cfg.get("boss_loop", {}).get("minimum_runs", 8)))
+        minimum_runs = max(
+            1, int(self.cfg.get("boss_loop", {}).get("minimum_runs", 10))
+        )
         while not self.stopped:
             # 每次退出都会回到普通地图，因此每一轮都重新用地图寻路到入口。
             self.travel_to_first_entrance()
@@ -2822,47 +2555,36 @@ class Bot:
                 self.pickup_and_exit()
                 completed_runs += 1
                 logging.info(
-                    "本轮疲劳恢复已完成 %s 次副本（至少 %s 次）。",
+                    "本轮疲劳恢复已完成 %s/%s 次 Boss 副本。",
                     completed_runs,
                     minimum_runs,
                 )
-                runtime_fatigue = self.runtime_fatigue()
-                if (
-                    runtime_fatigue is not None
-                    and runtime_fatigue >= self.cfg["fatigue"]["boss_target"]
-                ):
-                    logging.info(
-                        "Mono 疲劳已恢复到 %s，立即结束 BOSS 循环。",
-                        runtime_fatigue,
-                    )
-                    self.switch_weapon("farm")
-                    self.sell_cycle_medicine()
-                    self.travel_to_farm_spot()
-                    return
-                if completed_runs < minimum_runs:
-                    continue
             else:
-                # 超时可能是未击杀，也可能只是日志漏报。无论哪种情况都先安全
-                # 退出副本，再以实际疲劳值决定返回挂机还是继续下一轮。
+                # 没有疲劳死亡信号时同样安全退出，再根据画面中的当前疲劳决定下一轮。
                 self.exit_dungeon()
                 if self.stopped:
                     return
-                logging.info("BOSS 战超时后已退出副本，立即重新检查疲劳值。")
+                logging.info("BOSS 战超时后已安全退出副本。")
+
+            # 前十次已知的 Boss 恢复副本不做退出后 OCR：疲劳尚未到目标，
+            # 频繁移鼠标和推理只会拖慢循环。第十次完成后才开始复核目标值。
+            if completed_runs < minimum_runs:
+                logging.info(
+                    "尚未达到最低 %s 次 Boss 副本，跳过本次退出后的疲劳 OCR。",
+                    minimum_runs,
+                )
+                continue
+
             extra_ocr_rounds = max(
                 0,
-                int(
-                    self.cfg["fatigue"].get(
-                        "post_dungeon_extra_ocr_rounds", 2
-                    )
-                ),
+                int(self.cfg["fatigue"].get("post_dungeon_extra_ocr_rounds", 2)),
             )
             fatigue = self.read_fatigue_preferred(
                 refresh_rounds=1 + extra_ocr_rounds
             )
             if fatigue is None:
                 logging.warning(
-                    "退出副本后尚未获得可用疲劳值；"
-                    "不中断挂机，继续下一次副本。"
+                    "退出副本后尚未获得可用疲劳值；不中断挂机，继续下一次副本。"
                 )
                 continue
             if fatigue >= self.cfg["fatigue"]["boss_target"]:
@@ -2928,12 +2650,12 @@ class Bot:
                 self.remount_after_dark_dungeon_exit()
                 logging.warning("只刷副本模式本次 BOSS 超时，已退出并准备下一轮。")
 
-    def dark_boss_hp_route_test(self, cycles: int = 0) -> None:
-        """只读验证：入副本读一次 HP，仍走到 Boss 点截图，不进行战斗。"""
-        test_root = APP_DIR / "TMP" / "暗黑鲨鱼HP测试"
+    def dark_boss_visual_route_test(self, cycles: int = 0) -> None:
+        """只用外观模板验证暗黑鲨鱼路线并保存 Boss 点截图，不读取 HP。"""
+        test_root = APP_DIR / "TMP" / "暗黑鲨鱼视觉路线测试"
         run_dir = test_root / time.strftime("%Y%m%d_%H%M%S")
         run_dir.mkdir(parents=True, exist_ok=True)
-        logging.info("暗黑鲨鱼 HP 路线测试开始，截图目录：%s。", run_dir)
+        logging.info("暗黑鲨鱼视觉路线测试开始，截图目录：%s。", run_dir)
         count = 0
         self._dark_shark_mounted = False
         while not self.stopped and (cycles <= 0 or count < cycles):
@@ -2941,47 +2663,15 @@ class Bot:
             if not self.enter_dungeon_with_exit_recovery():
                 continue
             count += 1
-            hp = self.read_runtime_boss_hp(
-                max(
-                    0.5,
-                    float(
-                        self.cfg.get("dark_boss", {}).get(
-                            "entry_runtime_hp_timeout_seconds", 3.0
-                        )
-                    ),
-                ),
-                "测试入口",
-            )
-            hp_name = "NONE" if hp is None else str(hp)
-
-            normal_hp = int(
-                self.cfg.get("dark_boss", {}).get("normal_max_hp", 18000)
-            )
-            if hp == normal_hp:
-                logging.info(
-                    "暗黑鲨鱼 HP 路线测试第 %s 次：入口读到普通鲨鱼 HP=%s，快速跳过 Boss 路线。",
-                    count,
-                    hp,
-                )
+            if not self.classify_dark_boss_after_entry():
+                logging.info("第 %s 次未匹配暗黑鲨鱼外观，快速退出。", count)
                 self.dismount_before_dark_dungeon_exit()
                 self.exit_dungeon()
                 self.remount_after_dark_dungeon_exit()
                 continue
-
-            if hp is None:
-                logging.info(
-                    "暗黑鲨鱼 HP 路线测试第 %s 次：入口 HP=NONE，按当前实测规则继续暗黑鲨鱼路线。",
-                    count,
-                )
-            else:
-                logging.info(
-                    "暗黑鲨鱼 HP 路线测试第 %s 次：入口 HP=%s，不是普通鲨鱼，继续目标路线。",
-                    count,
-                    hp,
-                )
             self.travel_to_dark_boss(probe_at_end=False)
             frame = self.capture_frame()
-            image_path = run_dir / f"{count:04d}_{hp_name}.png"
+            image_path = run_dir / f"{count:04d}_dark_shark.png"
             try:
                 encoded_ok, encoded = cv2.imencode(".png", frame)
                 if not encoded_ok:
@@ -2989,35 +2679,11 @@ class Bot:
                 image_path.write_bytes(encoded.tobytes())
             except Exception as exc:
                 raise RuntimeError(f"无法保存测试截图：{image_path}（{exc}）") from exc
-            logging.info(
-                "暗黑鲨鱼 HP 路线测试第 %s 次：入口 HP=%s，已到达 Boss 点并保存截图 %s。",
-                count,
-                hp_name,
-                image_path,
-            )
-            if hp is None:
-                # NONE 按当前测试结论视为暗黑鲨鱼，沿用正式攻击流程；
-                # 到达 Boss 点后不得提前退出，必须等待 fight_boss() 确认死亡，
-                # 再拾取掉落并退出副本；不再重复读 HP。
-                logging.info(
-                    "入口 HP=NONE：保持暗黑鲨鱼完整流程，等待 Boss 死亡后拾取再退出。"
-                )
-                self.start_dark_boss_probe()
-                self.switch_weapon("boss")
-                boss_defeated = self.fight_boss()
-                if self.stopped:
-                    return
-                if boss_defeated:
-                    self.pickup_and_exit()
-                else:
-                    self.exit_dungeon()
-                self.remount_after_dark_dungeon_exit()
-            else:
-                # 其他非普通值只做路线验证，不攻击，避免把未知值直接当作目标开战。
-                self.dismount_before_dark_dungeon_exit()
-                self.exit_dungeon()
-                self.remount_after_dark_dungeon_exit()
-        logging.info("暗黑鲨鱼 HP 路线测试结束，共完成 %s 次。", count)
+            logging.info("第 %s 次已到达暗黑鲨鱼 Boss 点并保存截图 %s。", count, image_path)
+            self.dismount_before_dark_dungeon_exit()
+            self.exit_dungeon()
+            self.remount_after_dark_dungeon_exit()
+        logging.info("暗黑鲨鱼视觉路线测试结束，共完成 %s 次。", count)
 
     def run(self) -> None:
         required = [
@@ -3068,8 +2734,7 @@ class Bot:
                 winsound.Beep(450, 500)
 
     def close(self) -> None:
-        if self.runtime_probe is not None:
-            self.runtime_probe.stop()
+        self.ocr.close()
 
 
 CALIBRATION_STEPS = [
@@ -3294,9 +2959,10 @@ def ocr_test(cfg: dict) -> None:
         window.move_client(*hover, live=True)
         time.sleep(float(fatigue_cfg.get("hover_settle_seconds", 0.8)))
         value, texts = reader.read(
-            window.capture(),
+            window.capture_screen(),
             fatigue_cfg["ocr_region"],
             fatigue_cfg.get("value_region"),
+            fatigue_cfg.get("number_region"),
         )
     print(f"识别结果：{value}/1000；原始OCR：{texts}")
 
@@ -3389,9 +3055,10 @@ def focus_pulse_test(cfg: dict) -> None:
         )
         time.sleep(float(fatigue_cfg.get("hover_settle_seconds", 0.8)))
         fatigue, texts = reader.read(
-            window.capture(),
+            window.capture_screen(),
             fatigue_cfg["ocr_region"],
             fatigue_cfg.get("value_region"),
+            fatigue_cfg.get("number_region"),
         )
 
     focus_restored = win32gui.GetForegroundWindow() == previous_window
@@ -3562,15 +3229,17 @@ def main() -> int:
         help="用临时快速阈值真实执行至少两轮完整疲劳闭环",
     )
     parser.add_argument(
+        "--dark-boss-visual-test",
         "--dark-boss-hp-test",
+        dest="dark_boss_visual_test",
         action="store_true",
-        help="只读验证暗黑鲨鱼 HP 与路线；每轮只读一次并在 Boss 点截图",
+        help="只用画面模板验证暗黑鲨鱼路线，并在 Boss 点截图",
     )
     parser.add_argument(
         "--test-cycles",
         type=int,
         default=0,
-        help="HP 路线测试次数；0 表示持续运行，直到按 F12",
+        help="视觉路线测试次数；0 表示持续运行，直到按 F12",
     )
     parser.add_argument(
         "--smoke-cycles",
@@ -3642,13 +3311,13 @@ def main() -> int:
     instance_mutex = win32event.CreateMutex(None, False, "Local\\CuriousBeastAutomationMVP")
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         raise RuntimeError("已有一个挂机脚本正在运行，请先按 F12 关闭旧实例。")
-    if args.dark_boss_hp_test:
+    if args.dark_boss_visual_test:
         if not args.live:
-            raise RuntimeError("暗黑鲨鱼 HP 路线测试会真实控制游戏，必须同时传入 --live。")
+            raise RuntimeError("暗黑鲨鱼视觉路线测试会真实控制游戏，必须同时传入 --live。")
         bot = Bot(cfg, live=True, mode="dungeon")
         bot.running = True
         try:
-            bot.dark_boss_hp_route_test(cycles=max(0, args.test_cycles))
+            bot.dark_boss_visual_route_test(cycles=max(0, args.test_cycles))
         finally:
             bot.close()
             win32api.CloseHandle(instance_mutex)
