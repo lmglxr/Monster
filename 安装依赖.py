@@ -67,7 +67,10 @@ def main() -> int:
         if not run_pip(index_url, REQUIREMENTS):
             print(f"当前源安装失败，将切换下一个源：{index_url}")
             continue
-        if not run_pip(index_url, OCR_REQUIREMENTS, "install"):
+        # run_pip() already adds the `pip install` subcommand. Passing another
+        # literal "install" here makes pip try to download a package named
+        # `install`, causing every OCR dependency attempt to fail.
+        if not run_pip(index_url, OCR_REQUIREMENTS):
             print(f"当前源安装 OCR 依赖失败，将切换下一个源：{index_url}")
             continue
         if not repair_pywin32():
