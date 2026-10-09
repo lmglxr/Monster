@@ -1,3 +1,9 @@
 torch==2.14.0
 torchvision==0.29.0
 easyocr==1.7.2
+# Keep EasyOCR's transitive image stack compatible with the project's
+# deliberate NumPy 1.26.4 pin. Newer releases of these packages can require
+# NumPy 2.x, which otherwise leaves pip with a broken mixed environment.
+scikit-image==0.26.0
+scipy==1.17.1
+tifffile==2026.3.3

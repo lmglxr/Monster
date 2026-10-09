@@ -39,15 +39,13 @@ def sources() -> list[str]:
     return result
 
 
-def run_pip(index_url: str, requirements: Path, *extra: str) -> bool:
+def run_pip(index_url: str, *requirements: Path) -> bool:
     command = [
         sys.executable,
         "-m",
         "pip",
         "install",
-        *extra,
-        "-r",
-        str(requirements),
+        "--upgrade",
         "--disable-pip-version-check",
         "--index-url",
         index_url,
@@ -56,22 +54,32 @@ def run_pip(index_url: str, requirements: Path, *extra: str) -> bool:
         "--retries",
         "1",
     ]
+    for requirements_file in requirements:
+        command.extend(["-r", str(requirements_file)])
     completed = subprocess.run(command, cwd=APP_DIR, check=False)
+    return completed.returncode == 0
+
+
+def check_dependencies() -> bool:
+    """Reject a pip run that completed but left incompatible packages behind."""
+    completed = subprocess.run(
+        [sys.executable, "-m", "pip", "check", "--disable-pip-version-check"],
+        cwd=APP_DIR,
+        check=False,
+    )
     return completed.returncode == 0
 
 
 def main() -> int:
     print("正在准备纯视觉版 Python 依赖（含 EasyOCR）；网络较慢时会自动切换下载源。")
+    print("将一次性解析基础依赖和 OCR 依赖，以避免 NumPy 版本冲突。")
     for index_url in sources():
         print(f"尝试 Python 源：{index_url}")
-        if not run_pip(index_url, REQUIREMENTS):
+        if not run_pip(index_url, REQUIREMENTS, OCR_REQUIREMENTS):
             print(f"当前源安装失败，将切换下一个源：{index_url}")
             continue
-        # run_pip() already adds the `pip install` subcommand. Passing another
-        # literal "install" here makes pip try to download a package named
-        # `install`, causing every OCR dependency attempt to fail.
-        if not run_pip(index_url, OCR_REQUIREMENTS):
-            print(f"当前源安装 OCR 依赖失败，将切换下一个源：{index_url}")
+        if not check_dependencies():
+            print(f"当前源留下了不兼容的依赖，将切换下一个源：{index_url}")
             continue
         if not repair_pywin32():
             print("pywin32 后处理失败，将切换下一个源重试。")

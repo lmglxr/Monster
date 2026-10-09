@@ -23,19 +23,22 @@ def read_version() -> dict:
         return {"version": "unknown", "python": ["3.10", "3.11", "3.12"]}
 
 
-def required_packages(requirements: Path) -> list[tuple[str, str]]:
-    packages: list[tuple[str, str]] = []
+def required_packages(requirements: Path) -> list[tuple[str, str, str | None]]:
+    packages: list[tuple[str, str, str | None]] = []
     for line in requirements.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+        line = line.split("#", 1)[0].strip()
         if not line or line.startswith("#"):
             continue
-        name = line.split("==", 1)[0].strip()
+        name, separator, expected_version = line.partition("==")
+        name = name.strip()
+        expected_version = expected_version.strip() if separator else None
         import_name = {
             "opencv-python-headless": "cv2",
             "Pillow": "PIL",
             "pywin32": "win32api",
+            "scikit-image": "skimage",
         }.get(name, name.replace("-", "_"))
-        packages.append((name, import_name))
+        packages.append((name, import_name, expected_version))
     return packages
 
 
@@ -51,15 +54,35 @@ def check_python(version_info: dict) -> bool:
 
 def check_packages(requirements: Path, label: str = "") -> bool:
     success = True
-    for distribution, import_name in required_packages(requirements):
+    for distribution, import_name, expected_version in required_packages(requirements):
         try:
             installed = metadata.version(distribution)
+            if expected_version and installed != expected_version:
+                raise RuntimeError(f"版本为 {installed}，需要 {expected_version}")
             importlib.import_module(import_name)
             print(f"[通过] {label}{distribution} {installed}")
         except Exception as exc:
             print(f"[失败] {label}{distribution}: {exc}")
             success = False
     return success
+
+
+def check_dependency_health() -> bool:
+    """Use pip's metadata checker to catch transitive dependency conflicts."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "check", "--disable-pip-version-check"],
+            cwd=APP_DIR,
+            check=False,
+        )
+    except OSError as exc:
+        print(f"[失败] 无法运行 pip 依赖检查：{exc}")
+        return False
+    if result.returncode:
+        print("[失败] pip 检测到不兼容的依赖。")
+        return False
+    print("[通过] pip 依赖关系")
+    return True
 
 
 def install_requirements() -> bool:
@@ -127,14 +150,19 @@ def main() -> int:
     python_ok = check_python(version_info)
     packages_ok = check_packages(REQUIREMENTS)
     ocr_packages_ok = check_packages(OCR_REQUIREMENTS, "OCR ")
-    if args.install_missing and python_ok and (not packages_ok or not ocr_packages_ok):
+    dependencies_ok = check_dependency_health()
+    if args.install_missing and python_ok and (
+        not packages_ok or not ocr_packages_ok or not dependencies_ok
+    ):
         installed = install_requirements()
         packages_ok = installed and check_packages(REQUIREMENTS)
         ocr_packages_ok = installed and check_packages(OCR_REQUIREMENTS, "OCR ")
+        dependencies_ok = installed and check_dependency_health()
     checks = [
         python_ok,
         packages_ok,
         ocr_packages_ok,
+        dependencies_ok,
         check_project_files(),
         prepare_ocr_model(args.download_model),
     ]
