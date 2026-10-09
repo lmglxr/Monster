@@ -8,6 +8,8 @@ import sys
 from importlib import metadata
 from pathlib import Path
 
+from ocr_models import create_english_reader, validate_bundled_models
+
 
 APP_DIR = Path(__file__).resolve().parent
 REQUIREMENTS = APP_DIR / "requirements.txt"
@@ -118,15 +120,22 @@ def check_project_files() -> bool:
     return True
 
 
-def prepare_ocr_model(download_model: bool) -> bool:
-    if not download_model:
-        print("[跳过] EasyOCR 模型预下载（可用 --download-model 开启）")
+def check_bundled_ocr_models() -> bool:
+    failures = validate_bundled_models()
+    if failures:
+        print("[失败] 项目内置 EasyOCR 模型不可用：" + "；".join(failures))
+        return False
+    print("[通过] 项目内置 EasyOCR 英文模型（已校验，无需联网下载）")
+    return True
+
+
+def prepare_ocr_model(initialize_model: bool) -> bool:
+    if not initialize_model:
+        print("[跳过] EasyOCR 模型初始化（模型文件已在上方完成校验）")
         return True
     try:
-        import easyocr
-
-        print("[开始] 检查 EasyOCR 模型；首次运行可能需要下载约几分钟……")
-        easyocr.Reader(["en"], gpu=False, verbose=False)
+        print("[开始] 初始化项目内置 EasyOCR 模型……")
+        create_english_reader(verbose=False)
         print("[通过] EasyOCR 模型已准备好")
         return True
     except Exception as exc:
@@ -136,7 +145,11 @@ def prepare_ocr_model(download_model: bool) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Curious Beast 纯视觉版环境预检")
-    parser.add_argument("--download-model", action="store_true", help="提前下载并验证 EasyOCR 模型")
+    parser.add_argument(
+        "--download-model",
+        action="store_true",
+        help="兼容旧参数：初始化并验证项目内置 EasyOCR 模型，不进行网络下载",
+    )
     parser.add_argument(
         "--install-missing",
         action="store_true",
@@ -164,6 +177,7 @@ def main() -> int:
         ocr_packages_ok,
         dependencies_ok,
         check_project_files(),
+        check_bundled_ocr_models(),
         prepare_ocr_model(args.download_model),
     ]
     print("=" * 58)

@@ -28,6 +28,10 @@ SciPy 或 tifffile 要求 NumPy 2.x 时，pip 表面显示安装成功却留下�
 若环境检测报告依赖不兼容，请重新运行 `一键安装.bat` 修复项目私有 `.venv`；
 不要在系统 Python 中单独执行 `pip install easyocr`。
 
+EasyOCR 所需的英文检测和识别模型已随项目放在 `assets/easyocr_models/`。程序只使用
+这两份经校验的本地模型，不依赖 GitHub Releases 的首次下载；因此将完整项目文件夹复制
+到新电脑后，安装 Python 依赖即可运行。
+
 1. 启动游戏并进入角色画面，保持窗口化运行。游戏可以被遮挡，但不能最小化、锁屏或休眠。
 2. 双击 `启动挂机MVP.bat`。首次会创建 `.venv` 并安装 OpenCV、EasyOCR、torch 等依赖。
 3. 首次使用请按需要运行：
@@ -63,7 +67,7 @@ SciPy 或 tifffile 要求 NumPy 2.x 时，pip 表面显示安装成功却留下�
 
 ## 诊断与安全停止
 
-- `环境检测.py --download-model`：检查依赖并预下载 EasyOCR 模型。
+- `环境检测.py --download-model`：检查依赖并初始化项目内置的 EasyOCR 模型（兼容旧参数，不联网下载）。
 - `完整链路冒烟测试.bat`：以临时快速阈值执行至少两轮完整流程。
 - `runtime.log`：脚本自身运行日志；不读取游戏日志。
 - 窗口/截图恢复、复活失败、退出加载页未确认等情况会安全暂停或重试，避免盲目点击。

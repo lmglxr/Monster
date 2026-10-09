@@ -30,6 +30,8 @@ import win32process
 import win32ui
 import winerror
 
+from ocr_models import create_english_reader
+
 
 def enable_per_monitor_dpi_awareness() -> None:
     """Keep Win32 coordinates, cursor input and ImageGrab pixels in one scale."""
@@ -533,15 +535,13 @@ class GameWindow:
 
 class FatigueOCR:
     def __init__(self, debug_cfg: Optional[dict] = None) -> None:
-        import easyocr
-
-        logging.info("正在加载 EasyOCR 数字识别模型……")
+        logging.info("正在加载项目内置的 EasyOCR 数字识别模型……")
         warnings.filterwarnings(
             "ignore",
             message=r"'pin_memory' argument is set as true but no accelerator is found.*",
             category=UserWarning,
         )
-        self.reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+        self.reader = create_english_reader(verbose=False)
         self.debug_cfg = debug_cfg or {}
         self.last_debug_save = 0.0
 
